@@ -1,0 +1,42 @@
+[server]
+host = "0.0.0.0"
+port = 3000
+admin_password = "change-me"
+
+[oauth]
+client_id = "your-discord-client-id"
+client_secret = "your-discord-client-secret"
+redirect_uri = "https://proxy.example.com/api/auth/callback"
+required_guild_id = "your-discord-guild-id"
+
+[singbox]
+binary_path = "/usr/local/bin/sing-box"
+config_path = "data/singbox-config.json"
+base_port = 10001
+max_proxies = 20000
+prebound_proxies = 500
+binding_idle_secs = 300
+
+[database]
+url = "postgresql://postgres:change-me@127.0.0.1:5432/zenproxy"
+
+[validation]
+url = "https://www.bing.com"
+timeout_secs = 10
+concurrency = 200
+interval_mins = 5
+error_threshold = 10
+max_rounds_per_run = 200
+retry_invalid_per_run = 500
+batch_size = 300
+
+[quality]
+interval_mins = 120
+concurrency = 10
+
+[relay]
+timeout_secs = 600
+
+[subscription]
+auto_refresh_interval_mins = 0
+orphaned_valid_grace_hours = 24

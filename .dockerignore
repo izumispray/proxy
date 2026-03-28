@@ -1,0 +1,17 @@
+.git
+.gitignore
+.claude
+.vscode
+.idea
+target
+data
+example.zip
+examples
+deploy
+sing-box-dev-next
+sc0.yaml
+compile.txt
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

@@ -1,0 +1,22 @@
+services:
+  zenproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zenproxy
+    restart: unless-stopped
+    init: true
+    environment:
+      RUST_LOG: zenproxy=info,tower_http=info
+    expose:
+      - "3000"
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - ./data:/app/data
+    networks:
+      - new-api-net
+
+networks:
+  new-api-net:
+    external: true
+    name: newnewapi_new-api-net

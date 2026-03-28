@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Proxy</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+:root { --bg:#0f1117; --card:#1a1d27; --border:#2a2d3a; --primary:#6c63ff; --primary-hover:#5a52e0; --success:#22c55e; --danger:#ef4444; --warn:#f59e0b; --text:#e2e8f0; --text-dim:#94a3b8; --text-bright:#f8fafc; }
+body { font-family:'Segoe UI',system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; }
+.header { background:var(--card); border-bottom:1px solid var(--border); padding:16px 24px; display:flex; align-items:center; justify-content:space-between; }
+.header h1 { font-size:20px; color:var(--text-bright); }
+.header .nav { display:flex; align-items:center; gap:8px; }
+.header .nav a { color:var(--text-dim); text-decoration:none; padding:6px 12px; border-radius:6px; transition:all .2s; }
+.header .nav a:hover, .header .nav a.active { color:var(--primary); background:rgba(108,99,255,.1); }
+.header .user-info { display:flex; align-items:center; gap:12px; font-size:14px; color:var(--text-dim); }
+.header .user-info .username { color:var(--text-bright); font-weight:500; }
+.container { max-width:1400px; margin:0 auto; padding:24px; }
+.section { margin-bottom:32px; }
+.section-title { font-size:16px; font-weight:600; color:var(--text-bright); margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; }
+.card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; overflow-x:auto; }
+.btn { padding:10px 20px; border:none; border-radius:8px; font-size:14px; font-weight:500; cursor:pointer; transition:all .2s; display:inline-flex; align-items:center; gap:6px; }
+.btn-primary { background:var(--primary); color:#fff; }
+.btn-primary:hover { background:var(--primary-hover); }
+.btn-danger { background:var(--danger); color:#fff; }
+.btn-danger:hover { opacity:.85; }
+.btn-sm { padding:6px 12px; font-size:12px; }
+.btn-outline { background:transparent; border:1px solid var(--border); color:var(--text-dim); }
+.btn-outline:hover { border-color:var(--primary); color:var(--primary); }
+table { width:100%; border-collapse:collapse; }
+th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); font-size:13px; white-space:nowrap; }
+th { color:var(--text-dim); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.5px; cursor:pointer; user-select:none; }
+th:hover { color:var(--text); }
+tr:hover td { background:rgba(108,99,255,.03); }
+.badge { display:inline-block; padding:3px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+.badge-valid { background:rgba(34,197,94,.15); color:var(--success); }
+.badge-invalid { background:rgba(239,68,68,.15); color:var(--danger); }
+.badge-untested { background:rgba(245,158,11,.15); color:var(--warn); }
+.badge-type { background:rgba(108,99,255,.15); color:var(--primary); }
+.badge-risk-low { background:rgba(34,197,94,.15); color:var(--success); }
+.badge-risk-med { background:rgba(245,158,11,.15); color:var(--warn); }
+.badge-risk-high { background:rgba(239,68,68,.15); color:var(--danger); }
+.badge-unchecked { background:rgba(148,163,184,.1); color:var(--text-dim); }
+.stat-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:12px; margin-bottom:24px; }
+.stat-card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; text-align:center; }
+.stat-value { font-size:28px; font-weight:700; color:var(--text-bright); }
+.stat-label { font-size:12px; color:var(--text-dim); margin-top:4px; }
+.result-box { background:#0a0c10; border:1px solid var(--border); border-radius:8px; padding:16px; font-family:'Consolas','Courier New',monospace; font-size:13px; white-space:pre-wrap; word-break:break-all; max-height:400px; overflow-y:auto; margin-top:12px; }
+.toast { position:fixed; bottom:24px; right:24px; background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 20px; font-size:14px; z-index:999; animation:slideIn .3s ease; }
+@keyframes slideIn { from { transform:translateY(20px); opacity:0; } to { transform:translateY(0); opacity:1; } }
+.empty { text-align:center; color:var(--text-dim); padding:40px; }
+.inline-group { display:flex; gap:8px; align-items:end; }
+.inline-group .form-group { flex:1; margin-bottom:0; }
+.form-group { margin-bottom:14px; }
+.form-group label { display:block; font-size:13px; color:var(--text-dim); margin-bottom:6px; }
+.form-group input, .form-group select { width:100%; padding:10px 12px; background:#0f1117; border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:14px; outline:none; transition:border .2s; }
+.form-group input:focus, .form-group select:focus { border-color:var(--primary); }
+.checkbox-group { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:14px; }
+.checkbox-group label { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text-dim); cursor:pointer; }
+.checkbox-group input[type=checkbox] { width:auto; accent-color:var(--primary); }
+.login-overlay { position:fixed; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center; z-index:1000; }
+.login-box { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:40px; width:360px; text-align:center; }
+.login-box h2 { font-size:22px; color:var(--text-bright); margin-bottom:8px; }
+.login-box p { font-size:13px; color:var(--text-dim); margin-bottom:24px; }
+.login-box .btn { width:100%; justify-content:center; font-size:16px; padding:14px 24px; }
+.filter-bar { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; align-items:center; }
+.filter-bar input, .filter-bar select { padding:8px 12px; background:#0f1117; border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:13px; outline:none; }
+.filter-bar input:focus, .filter-bar select:focus { border-color:var(--primary); }
+
+/* API Key card */
+.apikey-card { background:linear-gradient(135deg, #1e2235 0%, #1a1d27 100%); border:1px solid var(--border); border-radius:14px; padding:24px; position:relative; overflow:hidden; }
+.apikey-card::before { content:''; position:absolute; top:-50%; right:-30%; width:200px; height:200px; background:radial-gradient(circle, rgba(108,99,255,.08) 0%, transparent 70%); pointer-events:none; }
+.apikey-label { font-size:12px; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px; margin-bottom:12px; }
+.apikey-value { display:flex; align-items:center; gap:10px; margin-bottom:16px; }
+.apikey-value input { flex:1; font-family:'Consolas','Courier New',monospace; font-size:15px; letter-spacing:0.5px; background:rgba(15,17,23,.6); border:1px solid var(--border); border-radius:8px; padding:12px 14px; color:var(--text-bright); outline:none; }
+.apikey-value input:focus { border-color:var(--primary); }
+.apikey-actions { display:flex; gap:8px; }
+.apikey-hint { font-size:12px; color:var(--text-dim); line-height:1.8; margin-top:16px; padding-top:16px; border-top:1px solid var(--border); }
+.apikey-hint code { background:rgba(108,99,255,.1); color:var(--primary); padding:2px 8px; border-radius:4px; font-size:11px; font-family:'Consolas','Courier New',monospace; }
+.apikey-hint .example { display:block; margin-top:8px; background:#0a0c10; border:1px solid var(--border); border-radius:6px; padding:10px 12px; font-family:'Consolas','Courier New',monospace; font-size:11px; color:var(--text-dim); word-break:break-all; white-space:pre-wrap; }
+.pagination { display:flex; align-items:center; justify-content:center; gap:4px; padding:16px 0 0; flex-wrap:wrap; }
+.pagination button { background:transparent; border:1px solid var(--border); color:var(--text-dim); border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; transition:all .2s; }
+.pagination button:hover { border-color:var(--primary); color:var(--primary); }
+.pagination button.active { background:var(--primary); border-color:var(--primary); color:#fff; }
+.pagination button:disabled { opacity:.4; cursor:default; }
+.pagination .page-info { font-size:13px; color:var(--text-dim); margin:0 8px; }
+</style>
+</head>
+<body>
+
+<!-- Login Screen -->
+<div class="login-overlay" id="login-overlay">
+  <div class="login-box">
+    <h2>Proxy</h2>
+    <p>使用 Discord 账号登录，并验证你已加入指定服务器</p>
+    <a class="btn btn-primary" href="/api/auth/login">使用 Discord 登录</a>
+  </div>
+</div>
+
+<!-- Main App -->
+<div id="app" style="display:none">
+<div class="header">
+  <h1>Proxy</h1>
+  <div class="nav">
+    <a href="/" class="active">仪表盘</a>
+    <a href="/admin">管理后台</a>
+    <a href="/docs">API 文档</a>
+    <div class="user-info">
+      <span class="username" id="header-username"></span>
+      <a href="javascript:void(0)" onclick="doLogout()" style="color:var(--danger)">退出登录</a>
+    </div>
+  </div>
+</div>
+
+<div class="container">
+  <!-- Stats -->
+  <div class="stat-grid">
+    <div class="stat-card"><div class="stat-value" id="stat-total">-</div><div class="stat-label">总代理数</div></div>
+    <div class="stat-card"><div class="stat-value" id="stat-valid">-</div><div class="stat-label">有效</div></div>
+    <div class="stat-card"><div class="stat-value" id="stat-invalid">-</div><div class="stat-label">无效</div></div>
+    <div class="stat-card"><div class="stat-value" id="stat-untested">-</div><div class="stat-label">待检测</div></div>
+    <div class="stat-card"><div class="stat-value" id="stat-checked">-</div><div class="stat-label">已质检</div></div>
+    <div class="stat-card"><div class="stat-value" id="stat-chatgpt">-</div><div class="stat-label">ChatGPT</div></div>
+    <div class="stat-card"><div class="stat-value" id="stat-google">-</div><div class="stat-label">Google</div></div>
+    <div class="stat-card"><div class="stat-value" id="stat-residential">-</div><div class="stat-label">住宅IP</div></div>
+  </div>
+
+  <!-- API Key -->
+  <div class="section">
+    <div class="section-title">API Key</div>
+    <div class="apikey-card">
+      <div class="apikey-label">Your API Key</div>
+      <div class="apikey-value">
+        <input id="api-key-display" readonly>
+        <div class="apikey-actions">
+          <button class="btn btn-primary btn-sm" onclick="copyApiKey()">复制</button>
+          <button class="btn btn-outline btn-sm" onclick="toggleKeyVisibility()" id="toggle-key-btn">显示</button>
+          <button class="btn btn-danger btn-sm" onclick="regenerateKey()">重新生成</button>
+        </div>
+      </div>
+      <div class="apikey-hint">
+        <strong>获取代理（/api/fetch）：</strong>支持 Header 或 Query 两种认证方式<br>
+        <code>curl -H "Authorization: Bearer &lt;api_key&gt;" https://proxy.mui.moe/api/fetch</code><br>
+        <code>curl "https://proxy.mui.moe/api/fetch?api_key=&lt;key&gt;"</code><br><br>
+        <strong>请求转发（/api/relay）：</strong>仅支持 Query 方式认证，Header 和 Cookie 会原样转发给目标<br>
+        <code>curl "https://proxy.mui.moe/api/relay?api_key=&lt;key&gt;&amp;url=https://httpbin.org/ip&amp;country=US"</code><br>
+        默认总超时 600 秒，可在 <code>config.toml</code> 的 <code>relay.timeout_secs</code> 调整
+      </div>
+    </div>
+  </div>
+
+  <!-- Proxy Quality Table -->
+  <div class="section">
+    <div class="section-title">
+      <span>代理质量 <span id="proxy-count" style="font-weight:400;font-size:13px;color:var(--text-dim)"></span></span>
+    </div>
+    <div class="filter-bar">
+      <input id="f-search" placeholder="搜索名称/服务器/IP..." oninput="queueLoadProxies()">
+      <select id="f-status" onchange="currentPage=1;loadProxies()">
+        <option value="">全部状态</option>
+        <option value="valid">有效</option>
+        <option value="invalid">无效</option>
+        <option value="untested">待检测</option>
+      </select>
+      <select id="f-quality" onchange="currentPage=1;loadProxies()">
+        <option value="">全部质量</option>
+        <option value="chatgpt">ChatGPT 可用</option>
+        <option value="google">Google 可用</option>
+        <option value="residential">住宅IP</option>
+        <option value="unchecked">未质检</option>
+      </select>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th onclick="sortBy('name')">名称</th>
+          <th onclick="sortBy('type')">类型</th>
+          <th onclick="sortBy('server')">服务器</th>
+          <th onclick="sortBy('is_valid')">状态</th>
+          <th>IP</th>
+          <th onclick="sortBy('country')">国家</th>
+          <th>IP类型</th>
+          <th onclick="sortBy('risk')">风险</th>
+          <th>ChatGPT</th>
+          <th>Google</th>
+          <th>住宅</th>
+        </tr></thead>
+        <tbody id="proxy-table"></tbody>
+      </table>
+      <div class="empty" id="proxy-empty">暂无代理</div>
+      <div class="pagination" id="proxy-pagination"></div>
+    </div>
+  </div>
+
+  <!-- Fetch Tool -->
+  <div class="section">
+    <div class="section-title">获取代理</div>
+    <div class="card">
+      <div class="checkbox-group">
+        <label><input type="checkbox" id="fetch-chatgpt"> ChatGPT</label>
+        <label><input type="checkbox" id="fetch-google"> Google</label>
+        <label><input type="checkbox" id="fetch-residential"> Residential</label>
+      </div>
+      <div class="inline-group">
+        <div class="form-group"><label>国家</label><input id="fetch-country" placeholder="例如 US"></div>
+        <div class="form-group"><label>类型</label><input id="fetch-type" placeholder="例如 vmess"></div>
+        <div class="form-group"><label>数量</label><input id="fetch-count" type="number" value="1" min="1"></div>
+        <button class="btn btn-primary" onclick="fetchProxy()">获取</button>
+      </div>
+      <div class="result-box" id="fetch-result" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- Relay Tool -->
+  <div class="section">
+    <div class="section-title">中继请求</div>
+    <div class="card">
+      <div class="form-group"><label>目标 URL</label><input id="relay-url" placeholder="https://httpbin.org/ip"></div>
+      <div class="checkbox-group">
+        <label><input type="checkbox" id="relay-chatgpt"> ChatGPT</label>
+        <label><input type="checkbox" id="relay-google"> Google</label>
+        <label><input type="checkbox" id="relay-residential"> Residential</label>
+      </div>
+      <div class="inline-group" style="margin-bottom:14px">
+        <div class="form-group"><label>国家</label><input id="relay-country" placeholder="例如 US"></div>
+        <div class="form-group"><label>类型</label><input id="relay-type" placeholder="例如 vmess"></div>
+      </div>
+      <button class="btn btn-primary" onclick="doRelay()">发送请求</button>
+      <div class="result-box" id="relay-result" style="display:none"></div>
+    </div>
+  </div>
+</div>
+</div>
+
+<script>
+let currentUser = null;
+let currentProxies = [];
+let sortField = 'name';
+let sortDir = 'asc';
+let keyVisible = false;
+let currentPage = 1;
+const pageSize = 50;
+let proxyTotal = 0;
+let proxyFiltered = 0;
+let proxyTotalPages = 0;
+let proxyFilterTimer = null;
+
+function toast(msg) {
+  const t = document.createElement('div');
+  t.className = 'toast'; t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3000);
+}
+
+function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function maskKey(key) {
+  if (!key || key.length < 12) return key;
+  return key.substring(0, 8) + '-****-****-' + key.substring(key.length - 4);
+}
+
+function updateKeyDisplay() {
+  const input = document.getElementById('api-key-display');
+  const btn = document.getElementById('toggle-key-btn');
+  if (!currentUser) return;
+  if (keyVisible) {
+    input.value = currentUser.api_key;
+    btn.textContent = '隐藏';
+  } else {
+    input.value = maskKey(currentUser.api_key);
+    btn.textContent = '显示';
+  }
+}
+
+function toggleKeyVisibility() {
+  keyVisible = !keyVisible;
+  updateKeyDisplay();
+}
+
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/auth/me');
+    if (r.status === 401) {
+      document.getElementById('login-overlay').style.display = '';
+      document.getElementById('app').style.display = 'none';
+      return;
+    }
+    currentUser = await r.json();
+    document.getElementById('login-overlay').style.display = 'none';
+    document.getElementById('app').style.display = '';
+    document.getElementById('header-username').textContent = currentUser.username;
+    updateKeyDisplay();
+    refresh();
+  } catch(e) {
+    document.getElementById('login-overlay').style.display = '';
+    document.getElementById('app').style.display = 'none';
+  }
+}
+
+async function doLogout() {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  currentUser = null;
+  location.reload();
+}
+
+function copyApiKey() {
+  if (!currentUser) return;
+  navigator.clipboard.writeText(currentUser.api_key).then(() => toast('已复制到剪贴板'));
+}
+
+async function regenerateKey() {
+  if (!confirm('确定要重新生成 API Key？旧的 Key 将立即失效。')) return;
+  try {
+    const r = await fetch('/api/auth/regenerate-key', { method: 'POST' });
+    const d = await r.json();
+    if (d.api_key) {
+      currentUser.api_key = d.api_key;
+      keyVisible = true;
+      updateKeyDisplay();
+      toast('API Key 已重新生成');
+    }
+  } catch(e) { toast('错误: ' + e.message); }
+}
+
+// --- Proxy data ---
+async function loadProxies() {
+  if (!currentUser) return;
+  try {
+    const params = new URLSearchParams({
+      api_key: currentUser.api_key,
+      page: String(currentPage),
+      page_size: String(pageSize),
+      sort: sortField,
+      dir: sortDir,
+    });
+    const search = document.getElementById('f-search').value.trim();
+    const status = document.getElementById('f-status').value;
+    const quality = document.getElementById('f-quality').value;
+    if (search) params.set('search', search);
+    if (status) params.set('status', status);
+    if (quality) params.set('quality', quality);
+    const r = await fetch('/api/proxies?' + params.toString());
+    const d = await r.json();
+    if (!d) return;
+    document.getElementById('stat-total').textContent = d.total ?? 0;
+    document.getElementById('stat-valid').textContent = d.valid ?? 0;
+    document.getElementById('stat-invalid').textContent = d.invalid ?? 0;
+    document.getElementById('stat-untested').textContent = d.untested ?? 0;
+    document.getElementById('stat-checked').textContent = d.quality_checked ?? 0;
+    document.getElementById('stat-chatgpt').textContent = d.chatgpt_accessible ?? 0;
+    document.getElementById('stat-google').textContent = d.google_accessible ?? 0;
+    document.getElementById('stat-residential').textContent = d.residential ?? 0;
+    currentProxies = d.proxies || [];
+    proxyTotal = d.total ?? 0;
+    proxyFiltered = d.filtered ?? proxyTotal;
+    proxyTotalPages = d.total_pages ?? 0;
+    renderProxies();
+  } catch(e) {}
+}
+
+function renderProxies() {
+  document.getElementById('proxy-count').textContent = `(${proxyFiltered} / ${proxyTotal})`;
+  const tb = document.getElementById('proxy-table');
+  const empty = document.getElementById('proxy-empty');
+  if (!currentProxies.length) { tb.innerHTML = ''; empty.style.display = ''; renderPagination(0, 0); return; }
+  empty.style.display = 'none';
+
+  tb.innerHTML = currentProxies.map(p => {
+    const q = p.quality;
+    const yes = '<span class="badge badge-valid">Yes</span>';
+    const no = '<span class="badge badge-invalid">No</span>';
+    const na = '<span class="badge badge-unchecked">-</span>';
+    let riskBadge = na;
+    if (q && q.risk_level && q.risk_level !== 'Unknown') {
+      const cls = q.risk_score < 0.25 ? 'badge-risk-low' : q.risk_score < 0.5 ? 'badge-risk-med' : 'badge-risk-high';
+      riskBadge = `<span class="badge ${cls}">${esc(q.risk_level)} ${(q.risk_score * 100).toFixed(0)}%</span>`;
+    }
+    return `<tr>
+      <td>${esc(p.name)}</td>
+      <td><span class="badge badge-type">${esc(p.type)}</span></td>
+      <td>${esc(p.server)}:${p.port}</td>
+      <td>${p.status==='valid'?'<span class="badge badge-valid">有效</span>':p.status==='untested'?'<span class="badge badge-untested">待检测</span>':'<span class="badge badge-invalid">无效</span>'}</td>
+      <td>${q && q.ip_address ? esc(q.ip_address) : '-'}</td>
+      <td>${q && q.country ? esc(q.country) : '-'}</td>
+      <td>${q && q.ip_type ? esc(q.ip_type) : '-'}</td>
+      <td>${riskBadge}</td>
+      <td>${q ? (q.chatgpt ? yes : no) : na}</td>
+      <td>${q ? (q.google ? yes : no) : na}</td>
+      <td>${q ? (q.is_residential ? yes : no) : na}</td>
+    </tr>`;
+  }).join('');
+
+  renderPagination(proxyFiltered, proxyTotalPages);
+}
+
+function renderPagination(total, totalPages) {
+  const container = document.getElementById('proxy-pagination');
+  if (totalPages <= 1) { container.innerHTML = ''; return; }
+  let html = '';
+  html += `<button ${currentPage<=1?'disabled':''} onclick="goPage(1)">&laquo;</button>`;
+  html += `<button ${currentPage<=1?'disabled':''} onclick="goPage(${currentPage-1})">&lsaquo;</button>`;
+  const maxVisible = 7;
+  let startPage = Math.max(1, currentPage - Math.floor(maxVisible/2));
+  let endPage = Math.min(totalPages, startPage + maxVisible - 1);
+  if (endPage - startPage < maxVisible - 1) startPage = Math.max(1, endPage - maxVisible + 1);
+  if (startPage > 1) html += `<span class="page-info">...</span>`;
+  for (let i = startPage; i <= endPage; i++) {
+    html += `<button class="${i===currentPage?'active':''}" onclick="goPage(${i})">${i}</button>`;
+  }
+  if (endPage < totalPages) html += `<span class="page-info">...</span>`;
+  html += `<button ${currentPage>=totalPages?'disabled':''} onclick="goPage(${currentPage+1})">&rsaquo;</button>`;
+  html += `<button ${currentPage>=totalPages?'disabled':''} onclick="goPage(${totalPages})">&raquo;</button>`;
+  const start = total === 0 ? 0 : (currentPage-1)*pageSize+1;
+  const end = Math.min(currentPage*pageSize,total);
+  html += `<span class="page-info">${start}-${end} / ${total}</span>`;
+  container.innerHTML = html;
+}
+
+function goPage(page) { currentPage = page; loadProxies(); }
+
+function sortBy(field) {
+  if (sortField === field) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+  else { sortField = field; sortDir = 'asc'; }
+  loadProxies();
+}
+
+function queueLoadProxies() {
+  currentPage = 1;
+  clearTimeout(proxyFilterTimer);
+  proxyFilterTimer = setTimeout(() => loadProxies(), 200);
+}
+
+// --- Fetch / Relay ---
+async function fetchProxy() {
+  if (!currentUser) return;
+  const params = new URLSearchParams();
+  params.set('api_key', currentUser.api_key);
+  if (document.getElementById('fetch-chatgpt').checked) params.set('chatgpt', 'true');
+  if (document.getElementById('fetch-google').checked) params.set('google', 'true');
+  if (document.getElementById('fetch-residential').checked) params.set('residential', 'true');
+  const country = document.getElementById('fetch-country').value.trim();
+  if (country) params.set('country', country);
+  const type_ = document.getElementById('fetch-type').value.trim();
+  if (type_) params.set('type', type_);
+  const count = document.getElementById('fetch-count').value;
+  if (count) params.set('count', count);
+  try {
+    const r = await fetch('/api/fetch?' + params.toString());
+    const text = await r.text();
+    const box = document.getElementById('fetch-result');
+    box.style.display = 'block';
+    let d;
+    try { d = JSON.parse(text); } catch(_) { box.textContent = '错误: ' + text; return; }
+    box.textContent = JSON.stringify(d, null, 2);
+  } catch(e) {
+    const box = document.getElementById('fetch-result');
+    box.style.display = 'block';
+    box.textContent = '错误: ' + e.message;
+  }
+}
+
+async function doRelay() {
+  if (!currentUser) return;
+  const url = document.getElementById('relay-url').value.trim();
+  if (!url) return toast('请输入目标 URL');
+  const params = new URLSearchParams({ url, api_key: currentUser.api_key });
+  if (document.getElementById('relay-chatgpt').checked) params.set('chatgpt', 'true');
+  if (document.getElementById('relay-google').checked) params.set('google', 'true');
+  if (document.getElementById('relay-residential').checked) params.set('residential', 'true');
+  const relayCountry = document.getElementById('relay-country').value.trim();
+  if (relayCountry) params.set('country', relayCountry);
+  const relayType = document.getElementById('relay-type').value.trim();
+  if (relayType) params.set('type', relayType);
+  const box = document.getElementById('relay-result');
+  box.style.display = 'block';
+  box.textContent = '请求中...';
+  try {
+    const r = await fetch('/api/relay?' + params.toString());
+    const body = await r.text();
+    const proxyId = r.headers.get('X-Proxy-Id') || '';
+    const proxyName = decodeURIComponent(r.headers.get('X-Proxy-Name') || '');
+    const proxyServer = r.headers.get('X-Proxy-Server') || '';
+    const proxyIP = r.headers.get('X-Proxy-IP') || '';
+    const proxyCountry = r.headers.get('X-Proxy-Country') || '';
+    const attempt = r.headers.get('X-Proxy-Attempt') || '';
+
+    let info = `状态: ${r.status}`;
+    if (proxyName) info += `\n代理: ${proxyName}`;
+    if (proxyServer) info += `  |  服务器: ${proxyServer}`;
+    if (proxyIP) info += `  |  出口IP: ${proxyIP}`;
+    if (proxyCountry) info += `  |  国家: ${proxyCountry}`;
+    if (attempt) info += `  |  尝试: ${attempt}次`;
+    if (proxyId) info += `\nID: ${proxyId}`;
+
+    // Try to pretty-print JSON body
+    let bodyText;
+    try { bodyText = JSON.stringify(JSON.parse(body), null, 2); } catch(_) { bodyText = body; }
+
+    box.textContent = info + '\n\n' + bodyText;
+  } catch(e) {
+    box.style.display = 'block';
+    box.textContent = '错误: ' + e.message;
+  }
+}
+
+function refresh() { loadProxies(); }
+checkAuth();
+</script>
+</body>
+</html>
