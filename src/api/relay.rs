@@ -69,9 +69,11 @@ pub async fn relay_request(
 ) -> Result<Response, AppError> {
     // Authenticate: relay requires api_key query parameter only,
     // so Authorization/Cookie headers are free for the target.
-    let api_key = params.api_key.as_deref()
+    let api_key = params
+        .api_key
+        .as_deref()
         .ok_or_else(|| AppError::BadRequest("Relay requires 'api_key' query parameter".into()))?;
-    auth::authenticate_request(&state, &headers, Some(api_key)).await?;
+    auth::authenticate_query_api_key_only(&state, api_key)?;
 
     let target_url = params
         .url
@@ -221,7 +223,7 @@ fn should_delete_proxy_after_relay_failure(error: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::should_delete_proxy_after_relay_failure;
+    use super::{should_delete_proxy_after_relay_failure, SKIP_HEADERS};
 
     #[test]
     fn permanent_binding_errors_are_deleted() {
@@ -239,6 +241,12 @@ mod tests {
             "error sending request for url (https://example.com/)"
         ));
         assert!(!should_delete_proxy_after_relay_failure("HTTP 502"));
+    }
+
+    #[test]
+    fn target_auth_headers_are_forwarded() {
+        assert!(!SKIP_HEADERS.contains(&"authorization"));
+        assert!(!SKIP_HEADERS.contains(&"cookie"));
     }
 }
 

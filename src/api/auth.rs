@@ -325,25 +325,10 @@ pub async fn extract_api_key_user(
     headers: &HeaderMap,
     query_api_key: Option<&str>,
 ) -> Result<User, AppError> {
-    // Try Authorization: Bearer <api_key> header first
-    let api_key = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|s| s.to_string())
-        .or_else(|| query_api_key.map(|s| s.to_string()));
+    let api_key = extract_request_api_key(headers, query_api_key);
 
     if let Some(key) = api_key {
-        let user = state
-            .db
-            .get_user_by_api_key(&key)?
-            .ok_or_else(|| AppError::Unauthorized("Invalid API key".into()))?;
-
-        if user.is_banned {
-            return Err(AppError::Unauthorized("Account banned".into()));
-        }
-
-        return Ok(user);
+        return lookup_api_key_user(state, &key);
     }
 
     Err(AppError::Unauthorized("No API key provided".into()))
@@ -352,19 +337,21 @@ pub async fn extract_api_key_user(
 /// Cache TTL for auth lookups — avoids hitting DB mutex on every relay request.
 const AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Relay auth is query-only so target Authorization/Cookie headers remain untouched.
+pub fn authenticate_query_api_key_only(
+    state: &AppState,
+    query_api_key: &str,
+) -> Result<User, AppError> {
+    authenticate_cached_api_key(state, query_api_key)
+}
+
 /// Try API key first, then session cookie. Uses in-memory cache.
 pub async fn authenticate_request(
     state: &AppState,
     headers: &HeaderMap,
     query_api_key: Option<&str>,
 ) -> Result<User, AppError> {
-    // Try API key (from header or query)
-    let api_key = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|s| s.to_string())
-        .or_else(|| query_api_key.map(|s| s.to_string()));
+    let api_key = extract_request_api_key(headers, query_api_key);
 
     if let Some(ref key) = api_key {
         let cache_key = format!("ak:{key}");
@@ -392,6 +379,42 @@ pub async fn authenticate_request(
     Err(AppError::Unauthorized(
         "Authentication required. Provide an API key or login via Discord OAuth.".into(),
     ))
+}
+
+fn extract_request_api_key(headers: &HeaderMap, query_api_key: Option<&str>) -> Option<String> {
+    extract_bearer_api_key(headers).or_else(|| query_api_key.map(|s| s.to_string()))
+}
+
+fn extract_bearer_api_key(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+}
+
+fn lookup_api_key_user(state: &AppState, api_key: &str) -> Result<User, AppError> {
+    let user = state
+        .db
+        .get_user_by_api_key(api_key)?
+        .ok_or_else(|| AppError::Unauthorized("Invalid API key".into()))?;
+
+    if user.is_banned {
+        return Err(AppError::Unauthorized("Account banned".into()));
+    }
+
+    Ok(user)
+}
+
+fn authenticate_cached_api_key(state: &AppState, api_key: &str) -> Result<User, AppError> {
+    let cache_key = format!("ak:{api_key}");
+    if let Some(user) = get_cached_user(state, &cache_key) {
+        return Ok(user);
+    }
+
+    let user = lookup_api_key_user(state, api_key)?;
+    cache_user(state, &cache_key, &user);
+    Ok(user)
 }
 
 fn get_cached_user(state: &AppState, cache_key: &str) -> Option<User> {
@@ -475,4 +498,39 @@ fn escape_html(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_bearer_api_key, extract_request_api_key};
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn request_auth_prefers_bearer_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer header-key"));
+
+        assert_eq!(
+            extract_request_api_key(&headers, Some("query-key")).as_deref(),
+            Some("header-key")
+        );
+    }
+
+    #[test]
+    fn request_auth_falls_back_to_query_key() {
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            extract_request_api_key(&headers, Some("query-key")).as_deref(),
+            Some("query-key")
+        );
+    }
+
+    #[test]
+    fn bearer_extraction_returns_none_for_non_bearer_auth() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Basic abc123"));
+
+        assert_eq!(extract_bearer_api_key(&headers), None);
+    }
 }
