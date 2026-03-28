@@ -4,6 +4,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY README.md ./README.md
 COPY src ./src
 COPY config.toml ./config.toml
+COPY config.toml.example ./config.toml.example
 RUN cargo build --release && strip target/release/zenproxy
 
 FROM golang:1.24-bookworm AS singbox-builder
