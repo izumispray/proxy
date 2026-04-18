@@ -18,6 +18,7 @@ prebound_proxies = 500
 binding_idle_secs = 300
 watchdog_interval_secs = 60
 restart_interval_mins = 0
+memory_restart_mb = 3072
 
 [database]
 url = "postgresql://postgres:change-me@127.0.0.1:5432/zenproxy"

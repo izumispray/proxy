@@ -49,6 +49,9 @@ pub struct SingboxConfig {
     pub watchdog_interval_secs: u64,
     #[serde(default)]
     pub restart_interval_mins: u64,
+    /// Restart sing-box when its RSS exceeds this many MiB. Set 0 to disable.
+    #[serde(default = "default_memory_restart_mb")]
+    pub memory_restart_mb: u64,
     pub api_secret: Option<String>,
 }
 
@@ -70,6 +73,10 @@ fn default_api_port() -> u16 {
 
 fn default_watchdog_interval_secs() -> u64 {
     60
+}
+
+fn default_memory_restart_mb() -> u64 {
+    3072
 }
 
 #[derive(Debug, Clone, Deserialize)]

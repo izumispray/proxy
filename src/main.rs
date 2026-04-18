@@ -15,6 +15,7 @@ use crate::singbox::process::SingboxManager;
 use dashmap::DashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use sysinfo::{Pid, System};
 use tokio::sync::Mutex;
 
 pub struct AppState {
@@ -247,31 +248,61 @@ async fn start_background_tasks(state: Arc<AppState>) {
     });
 }
 
+fn read_process_memory_mb(pid: u32) -> Option<u64> {
+    let pid = Pid::from_u32(pid);
+    let system = System::new_all();
+    system
+        .process(pid)
+        .map(|process| process.memory() / 1024 / 1024)
+}
+
 async fn check_singbox_watchdog(state: &Arc<AppState>) {
     let restart_reason = {
         let mut mgr = state.singbox.lock().await;
         if !mgr.is_running() {
-            Some("process exited")
-        } else if mgr.should_restart_for_interval() {
-            Some("scheduled interval")
+            Some("process exited".to_string())
         } else {
-            None
+            let memory_restart_mb = state.config.singbox.memory_restart_mb;
+            if memory_restart_mb > 0 {
+                if let Some(memory_mb) = mgr
+                    .process_id()
+                    .and_then(read_process_memory_mb)
+                    .filter(|memory_mb| *memory_mb >= memory_restart_mb)
+                {
+                    Some(format!(
+                        "memory threshold exceeded: {memory_mb} MiB >= {memory_restart_mb} MiB"
+                    ))
+                } else if mgr.should_restart_for_interval() {
+                    Some("scheduled interval".to_string())
+                } else {
+                    None
+                }
+            } else if mgr.should_restart_for_interval() {
+                Some("scheduled interval".to_string())
+            } else {
+                None
+            }
         }
     };
 
     let Some(reason) = restart_reason else {
         return;
     };
+    let requires_quiet_restart = reason != "process exited";
 
-    if reason == "scheduled interval" && state.binding_usage.iter().any(|entry| entry.in_flight > 0) {
-        tracing::info!("Skipping scheduled sing-box restart because active relay requests are in flight");
+    if requires_quiet_restart && state.binding_usage.iter().any(|entry| entry.in_flight > 0) {
+        tracing::info!(
+            "Skipping sing-box watchdog restart because active relay requests are in flight: {reason}"
+        );
         return;
     }
 
     let _binding_lock = state.validation_lock.lock().await;
 
-    if reason == "scheduled interval" && state.binding_usage.iter().any(|entry| entry.in_flight > 0) {
-        tracing::info!("Skipping scheduled sing-box restart after lock acquisition because relay requests resumed");
+    if requires_quiet_restart && state.binding_usage.iter().any(|entry| entry.in_flight > 0) {
+        tracing::info!(
+            "Skipping sing-box watchdog restart after lock acquisition because relay requests resumed: {reason}"
+        );
         return;
     }
 

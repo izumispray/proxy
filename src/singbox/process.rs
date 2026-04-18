@@ -578,6 +578,10 @@ impl SingboxManager {
         }
     }
 
+    pub fn process_id(&self) -> Option<u32> {
+        self.process.as_ref().and_then(|child| child.id())
+    }
+
     pub fn used_ports(&self) -> usize {
         self.port_pool.used_count()
     }
