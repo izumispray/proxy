@@ -175,6 +175,21 @@ pub async fn delete_subscription(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let proxies = state
+        .db
+        .get_proxies_by_subscription(&id)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    for proxy in &proxies {
+        crate::bindings::cleanup_proxy_binding(
+            &state,
+            &proxy.id,
+            proxy.local_port.map(|port| port as u16),
+        )
+        .await;
+        state.binding_usage.remove(&proxy.id);
+    }
+
     state.pool.remove_by_subscription(&id);
     state.db.delete_subscription(&id)?;
 
@@ -348,6 +363,13 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
             state.db.mark_proxy_orphaned(&old.id, &now).ok();
             orphaned_valid += 1;
         } else if old.last_validated.is_some() {
+            crate::bindings::cleanup_proxy_binding(
+                state,
+                &old.id,
+                old.local_port.map(|port| port as u16),
+            )
+            .await;
+            state.binding_usage.remove(&old.id);
             state.pool.remove(&old.id);
             state.db.delete_proxy(&old.id).ok();
             removed_invalid += 1;

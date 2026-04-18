@@ -45,6 +45,10 @@ pub struct SingboxConfig {
     pub binding_idle_secs: u64,
     #[serde(default = "default_api_port")]
     pub api_port: u16,
+    #[serde(default = "default_watchdog_interval_secs")]
+    pub watchdog_interval_secs: u64,
+    #[serde(default)]
+    pub restart_interval_mins: u64,
     pub api_secret: Option<String>,
 }
 
@@ -62,6 +66,10 @@ fn default_binding_idle_secs() -> u64 {
 
 fn default_api_port() -> u16 {
     9090
+}
+
+fn default_watchdog_interval_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Deserialize)]

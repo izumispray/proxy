@@ -16,6 +16,8 @@ base_port = 10001
 max_proxies = 20000
 prebound_proxies = 500
 binding_idle_secs = 300
+watchdog_interval_secs = 60
+restart_interval_mins = 0
 
 [database]
 url = "postgresql://postgres:change-me@127.0.0.1:5432/zenproxy"

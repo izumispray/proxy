@@ -231,6 +231,80 @@ async fn start_background_tasks(state: Arc<AppState>) {
             refresh_due_subscriptions(&state_clone).await;
         }
     });
+
+    let state_clone = state.clone();
+    // sing-box watchdog / scheduled restart safeguard
+    tokio::spawn(async move {
+        let interval_secs = state_clone.config.singbox.watchdog_interval_secs;
+        if interval_secs == 0 {
+            return;
+        }
+        let interval = std::time::Duration::from_secs(interval_secs);
+        loop {
+            tokio::time::sleep(interval).await;
+            check_singbox_watchdog(&state_clone).await;
+        }
+    });
+}
+
+async fn check_singbox_watchdog(state: &Arc<AppState>) {
+    let restart_reason = {
+        let mut mgr = state.singbox.lock().await;
+        if !mgr.is_running() {
+            Some("process exited")
+        } else if mgr.should_restart_for_interval() {
+            Some("scheduled interval")
+        } else {
+            None
+        }
+    };
+
+    let Some(reason) = restart_reason else {
+        return;
+    };
+
+    if reason == "scheduled interval" && state.binding_usage.iter().any(|entry| entry.in_flight > 0) {
+        tracing::info!("Skipping scheduled sing-box restart because active relay requests are in flight");
+        return;
+    }
+
+    let _binding_lock = state.validation_lock.lock().await;
+
+    if reason == "scheduled interval" && state.binding_usage.iter().any(|entry| entry.in_flight > 0) {
+        tracing::info!("Skipping scheduled sing-box restart after lock acquisition because relay requests resumed");
+        return;
+    }
+
+    tracing::warn!("sing-box watchdog triggered restart: {reason}");
+
+    {
+        let mut mgr = state.singbox.lock().await;
+        let restart_result = if mgr.is_running() {
+            mgr.restart().await
+        } else {
+            mgr.start().await
+        };
+
+        if let Err(e) = restart_result {
+            tracing::error!("sing-box watchdog failed to restart process: {e}");
+            return;
+        }
+    }
+
+    state.pool.clear_all_local_ports();
+    state.db.clear_all_proxy_local_ports().ok();
+    state.relay_clients.clear();
+
+    let sync_result = crate::api::subscription::sync_proxy_bindings(
+        state,
+        crate::api::subscription::SyncMode::Normal,
+    )
+    .await;
+
+    tracing::info!(
+        "sing-box watchdog recovered process and re-synced {} bindings",
+        sync_result.selected_ids.len()
+    );
 }
 
 async fn shutdown_signal() {

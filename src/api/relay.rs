@@ -103,7 +103,7 @@ pub async fn relay_request(
             let local_port = match crate::bindings::ensure_binding(&state, &proxy, false).await {
                 Ok(port) => port,
                 Err(e) => {
-                    record_relay_failure(&state, &proxy, None, &e.to_string());
+                    record_relay_failure(&state, &proxy, None, &e.to_string()).await;
                     return Err(e);
                 }
             };
@@ -114,7 +114,7 @@ pub async fn relay_request(
                     return Ok(build_streaming_response(resp, &proxy, None, usage));
                 }
                 Err(e) => {
-                    record_relay_failure(&state, &proxy, Some(local_port), &e);
+                    record_relay_failure(&state, &proxy, Some(local_port), &e).await;
                     return Err(AppError::Internal(format!("Relay failed: {e}")));
                 }
             }
@@ -139,7 +139,7 @@ pub async fn relay_request(
                     proxy.name,
                     e
                 );
-                record_relay_failure(&state, proxy, None, &e.to_string());
+                record_relay_failure(&state, proxy, None, &e.to_string()).await;
                 continue;
             }
         };
@@ -161,7 +161,7 @@ pub async fn relay_request(
                     attempt + 1,
                     proxy.name
                 );
-                record_relay_failure(&state, proxy, Some(local_port), &e);
+                record_relay_failure(&state, proxy, Some(local_port), &e).await;
                 continue;
             }
         }
@@ -183,7 +183,7 @@ fn validate_target_url(target_url: &str) -> Result<reqwest::Url, AppError> {
     }
 }
 
-fn record_relay_failure(
+async fn record_relay_failure(
     state: &Arc<AppState>,
     proxy: &PoolProxy,
     local_port: Option<u16>,
@@ -191,11 +191,7 @@ fn record_relay_failure(
 ) {
     tracing::debug!("Relay failure recorded for {}: {}", proxy.name, error);
 
-    if let Some(port) = local_port {
-        state.relay_clients.remove(&port);
-    }
-    state.pool.clear_local_port(&proxy.id);
-    state.db.update_proxy_local_port_null(&proxy.id).ok();
+    crate::bindings::cleanup_proxy_binding(state, &proxy.id, local_port).await;
 
     if should_delete_proxy_after_relay_failure(error) {
         tracing::warn!(
@@ -203,8 +199,8 @@ fn record_relay_failure(
             proxy.name,
             error
         );
-        state.pool.remove(&proxy.id);
         state.binding_usage.remove(&proxy.id);
+        state.pool.remove(&proxy.id);
         state.db.delete_proxy(&proxy.id).ok();
         return;
     }

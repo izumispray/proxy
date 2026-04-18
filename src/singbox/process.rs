@@ -13,6 +13,7 @@ pub struct SingboxManager {
     client: reqwest::Client,
     api_base: String,
     port_pool: PortPool,
+    started_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +68,10 @@ impl PortPool {
             .collect();
     }
 
+    fn clear(&mut self) {
+        self.used.clear();
+    }
+
     fn in_range(&self, port: u16) -> bool {
         let start = self.base_port.saturating_add(1);
         let end = self.base_port.saturating_add(self.max_ports);
@@ -95,11 +100,17 @@ impl SingboxManager {
             client,
             api_base,
             port_pool: PortPool::new(base_port, max_ports),
+            started_at: None,
         }
     }
 
     /// Start sing-box with minimal config, then poll the API until ready.
     pub async fn start(&mut self) -> Result<(), String> {
+        if self.process.is_some() {
+            tracing::warn!("sing-box start requested while process is still tracked; restarting it first");
+            self.stop().await;
+        }
+
         // Generate minimal config
         let api_addr = format!("127.0.0.1:{}", self.config.api_port);
         let api_secret = self.config.api_secret.as_deref().unwrap_or("");
@@ -145,6 +156,7 @@ impl SingboxManager {
             .map_err(|e| format!("Failed to start sing-box: {e}"))?;
 
         tracing::info!("sing-box started with PID: {:?}", child.id());
+        self.started_at = Some(std::time::Instant::now());
         self.process = Some(child);
 
         // Poll the Clash API until it's ready
@@ -170,12 +182,85 @@ impl SingboxManager {
     }
 
     pub async fn stop(&mut self) {
+        if self.process.is_some() {
+            match self.delete_all_bindings().await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!("Removed {removed} bindings before stopping sing-box");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("Failed to delete bindings before stopping sing-box: {e}");
+                }
+            }
+        }
+
         if let Some(mut child) = self.process.take() {
             tracing::info!("Stopping sing-box process...");
             let _ = child.kill().await;
             let _ = child.wait().await;
             tracing::info!("sing-box process stopped");
         }
+
+        self.started_at = None;
+        self.port_pool.clear();
+    }
+
+    pub async fn restart(&mut self) -> Result<(), String> {
+        self.stop().await;
+        self.start().await
+    }
+
+    pub fn should_restart_for_interval(&self) -> bool {
+        let restart_interval_mins = self.config.restart_interval_mins;
+        restart_interval_mins > 0
+            && self.started_at.is_some_and(|started_at| {
+                started_at.elapsed()
+                    >= std::time::Duration::from_secs(restart_interval_mins.saturating_mul(60))
+            })
+    }
+
+    async fn delete_all_bindings(&mut self) -> Result<usize, String> {
+        let current = match self.fetch_bindings().await {
+            Ok(bindings) => bindings,
+            Err(e) => {
+                self.port_pool.clear();
+                return Err(e);
+            }
+        };
+
+        if current.is_empty() {
+            self.port_pool.clear();
+            return Ok(0);
+        }
+
+        let url = format!("{}/bindings/all", self.api_base);
+        let secret = self.config.api_secret.clone().unwrap_or_default();
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(&secret)
+            .send()
+            .await
+            .map_err(|e| format!("Bindings API DELETE ALL request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Bindings API DELETE ALL returned {status}: {body}"));
+        }
+
+        self.port_pool.clear();
+        Ok(current.len())
+    }
+
+    pub async fn remove_binding_by_id(&mut self, proxy_id: &str) -> Result<Option<u16>, String> {
+        let bindings = self.refresh_port_pool_from_api().await?;
+        if let Some(port) = find_binding_port(&bindings, proxy_id) {
+            self.remove_binding(proxy_id, port).await?;
+            return Ok(Some(port));
+        }
+
+        Ok(None)
     }
 
     async fn fetch_bindings(&self) -> Result<Vec<ApiBinding>, String> {
@@ -476,10 +561,17 @@ impl SingboxManager {
             match child.try_wait() {
                 Ok(Some(_)) => {
                     self.process = None;
+                    self.started_at = None;
+                    self.port_pool.clear();
                     false
                 }
                 Ok(None) => true,
-                Err(_) => false,
+                Err(_) => {
+                    self.process = None;
+                    self.started_at = None;
+                    self.port_pool.clear();
+                    false
+                }
             }
         } else {
             false

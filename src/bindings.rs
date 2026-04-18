@@ -144,6 +144,56 @@ pub async fn ensure_binding(
     Ok(port)
 }
 
+pub async fn cleanup_proxy_binding(
+    state: &Arc<AppState>,
+    proxy_id: &str,
+    local_port: Option<u16>,
+) {
+    let removed_port = {
+        let mut mgr = state.singbox.lock().await;
+        match local_port {
+            Some(port) => match mgr.remove_binding(proxy_id, port).await {
+                Ok(()) => Some(port),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to remove binding {proxy_id} on known port {port}: {e}; retrying by API lookup"
+                    );
+                    match mgr.remove_binding_by_id(proxy_id).await {
+                        Ok(port) => port,
+                        Err(retry_err) => {
+                            tracing::warn!(
+                                "Failed to remove binding {proxy_id} by API lookup after direct remove error: {retry_err}"
+                            );
+                            None
+                        }
+                    }
+                }
+            },
+            None => match mgr.remove_binding_by_id(proxy_id).await {
+                Ok(port) => port,
+                Err(e) => {
+                    tracing::warn!("Failed to remove binding {proxy_id} by API lookup: {e}");
+                    None
+                }
+            },
+        }
+    };
+
+    if let Some(port) = local_port {
+        state.relay_clients.remove(&port);
+    }
+    if let Some(port) = removed_port {
+        state.relay_clients.remove(&port);
+    }
+    if local_port.is_some() || removed_port.is_some() {
+        state.pool.clear_local_port(proxy_id);
+        state.db.update_proxy_local_port_null(proxy_id).ok();
+    }
+    if removed_port.is_some() {
+        state.binding_usage.remove(proxy_id);
+    }
+}
+
 pub async fn cleanup_idle_bindings(state: Arc<AppState>) -> Result<usize, String> {
     let idle_after = Duration::from_secs(state.config.singbox.binding_idle_secs);
     let candidates: Vec<(String, u16)> = state
@@ -164,7 +214,6 @@ pub async fn cleanup_idle_bindings(state: Arc<AppState>) -> Result<usize, String
         return Ok(0);
     }
 
-    let mut mgr = state.singbox.lock().await;
     let mut removed = Vec::new();
 
     for (id, port) in candidates {
@@ -178,18 +227,10 @@ pub async fn cleanup_idle_bindings(state: Arc<AppState>) -> Result<usize, String
             continue;
         }
 
-        match mgr.remove_binding(&id, port).await {
-            Ok(()) => removed.push((id, port)),
-            Err(e) => tracing::warn!("Failed to remove idle binding {id}: {e}"),
+        cleanup_proxy_binding(&state, &id, Some(port)).await;
+        if state.pool.get(&id).and_then(|p| p.local_port).is_none() {
+            removed.push((id, port));
         }
-    }
-    drop(mgr);
-
-    for (id, port) in &removed {
-        state.pool.clear_local_port(id);
-        state.db.update_proxy_local_port_null(id).ok();
-        state.relay_clients.remove(port);
-        state.binding_usage.remove(id);
     }
 
     Ok(removed.len())

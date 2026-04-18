@@ -1,4 +1,4 @@
-use crate::api::fetch::{list_query_to_db, proxy_list_item_to_json, ListProxyQuery};
+use crate::api::fetch::{find_proxy_snapshot, list_query_to_db, proxy_list_item_to_json, ListProxyQuery};
 use crate::error::AppError;
 use crate::AppState;
 use axum::extract::{Path, Query, State};
@@ -28,6 +28,12 @@ pub async fn delete_proxy(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let proxy = find_proxy_snapshot(&state, &id)?;
+    if let Some(proxy) = &proxy {
+        crate::bindings::cleanup_proxy_binding(&state, &proxy.id, proxy.local_port).await;
+    }
+
+    state.binding_usage.remove(&id);
     state.pool.remove(&id);
     state.db.delete_proxy(&id)?;
     Ok(Json(json!({ "message": "Proxy deleted" })))
@@ -37,14 +43,24 @@ pub async fn cleanup_proxies(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let threshold = state.config.validation.error_threshold;
+
+    // Remove bindings before deleting DB rows so sing-box listeners do not leak.
+    let targets: Vec<_> = state
+        .pool
+        .get_all()
+        .into_iter()
+        .filter(|proxy| proxy.error_count >= threshold)
+        .collect();
+    for proxy in &targets {
+        crate::bindings::cleanup_proxy_binding(&state, &proxy.id, proxy.local_port).await;
+    }
+
     let count = state.db.cleanup_high_error_proxies(threshold)?;
 
     // Remove from pool too
-    let all = state.pool.get_all();
-    for p in &all {
-        if p.error_count >= threshold {
-            state.pool.remove(&p.id);
-        }
+    for proxy in &targets {
+        state.binding_usage.remove(&proxy.id);
+        state.pool.remove(&proxy.id);
     }
 
     Ok(Json(json!({

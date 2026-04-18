@@ -141,7 +141,7 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
             .collect();
 
         for proxy in &failed_to_bind {
-            drop_proxy_after_binding_failure(&state, proxy);
+            drop_proxy_after_binding_failure(&state, proxy).await;
         }
 
         // Collect only the untested proxies selected for this round that actually got bindings.
@@ -205,14 +205,21 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
 
     // Cleanup high-error proxies (once, after all rounds)
     let threshold = state.config.validation.error_threshold;
+    let high_error_targets: Vec<_> = state
+        .pool
+        .get_all()
+        .into_iter()
+        .filter(|proxy| proxy.error_count >= threshold)
+        .collect();
+    for proxy in &high_error_targets {
+        crate::bindings::cleanup_proxy_binding(&state, &proxy.id, proxy.local_port).await;
+    }
     match state.db.cleanup_high_error_proxies(threshold) {
         Ok(count) if count > 0 => {
             tracing::info!("Cleaned up {count} proxies exceeding error threshold");
-            let all = state.pool.get_all();
-            for p in &all {
-                if p.error_count >= threshold {
-                    state.pool.remove(&p.id);
-                }
+            for proxy in &high_error_targets {
+                state.binding_usage.remove(&proxy.id);
+                state.pool.remove(&proxy.id);
             }
         }
         _ => {}
@@ -230,11 +237,15 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-fn drop_proxy_after_binding_failure(state: &Arc<AppState>, proxy: &crate::pool::manager::PoolProxy) {
+async fn drop_proxy_after_binding_failure(
+    state: &Arc<AppState>,
+    proxy: &crate::pool::manager::PoolProxy,
+) {
     tracing::warn!(
         "Proxy {} failed to get binding, deleting immediately",
         proxy.name
     );
+    crate::bindings::cleanup_proxy_binding(state, &proxy.id, proxy.local_port).await;
     state.binding_usage.remove(&proxy.id);
     state.pool.remove(&proxy.id);
     state.db.delete_proxy(&proxy.id).ok();
@@ -285,6 +296,9 @@ async fn validate_batch(
                         .update_proxy_validation(&proxy_id, false, Some(&e))
                         .ok();
                     if state.db.delete_proxy_if_orphaned(&proxy_id).unwrap_or(false) {
+                        crate::bindings::cleanup_proxy_binding(&state, &proxy_id, Some(local_port))
+                            .await;
+                        state.binding_usage.remove(&proxy_id);
                         state.pool.remove(&proxy_id);
                     }
                 }
