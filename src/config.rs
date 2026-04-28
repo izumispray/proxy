@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::env;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -13,6 +14,8 @@ pub struct AppConfig {
     pub relay: RelayConfig,
     #[serde(default)]
     pub subscription: SubscriptionConfig,
+    #[serde(default)]
+    pub proxy_listener: Vec<ProxyListenerConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -158,11 +161,90 @@ fn default_orphaned_valid_grace_hours() -> u64 {
     24
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ProxyListenerConfig {
+    #[serde(default)]
+    pub name: String,
+    pub listen: String,
+    pub username: String,
+    pub password: String,
+}
+
 impl AppConfig {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string("config.toml")
             .unwrap_or_else(|_| include_str!("../config.toml.example").to_string());
-        let config: AppConfig = toml::from_str(&content)?;
+        let mut config: AppConfig = toml::from_str(&content)?;
+        config.apply_env_overrides()?;
         Ok(config)
     }
+
+    fn apply_env_overrides(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        set_string_from_env(&mut self.server.host, "ZENPROXY_SERVER_HOST");
+        set_u16_from_env(&mut self.server.port, "ZENPROXY_SERVER_PORT")?;
+        set_string_from_env(&mut self.server.admin_password, "ZENPROXY_ADMIN_PASSWORD");
+
+        set_string_from_env(&mut self.database.url, "ZENPROXY_DATABASE_URL");
+
+        set_string_from_env(&mut self.oauth.client_id, "ZENPROXY_OAUTH_CLIENT_ID");
+        set_string_from_env(&mut self.oauth.client_secret, "ZENPROXY_OAUTH_CLIENT_SECRET");
+        set_string_from_env(&mut self.oauth.redirect_uri, "ZENPROXY_OAUTH_REDIRECT_URI");
+        set_string_from_env(
+            &mut self.oauth.required_guild_id,
+            "ZENPROXY_OAUTH_REQUIRED_GUILD_ID",
+        );
+
+        // Proxy listeners from env: ZENPROXY_PROXY_LISTENER or ZENPROXY_PROXY_LISTENER_1..N
+        let mut env_listeners = Vec::new();
+        if let Some(val) = env_value("ZENPROXY_PROXY_LISTENER") {
+            if let Some(cfg) = parse_listener_uri(&val, "env") {
+                env_listeners.push(cfg);
+            }
+        }
+        for i in 1..=10 {
+            let key = format!("ZENPROXY_PROXY_LISTENER_{i}");
+            if let Some(val) = env_value(&key) {
+                if let Some(cfg) = parse_listener_uri(&val, &format!("env-{i}")) {
+                    env_listeners.push(cfg);
+                }
+            }
+        }
+        if !env_listeners.is_empty() {
+            self.proxy_listener = env_listeners;
+        }
+
+        Ok(())
+    }
+}
+
+fn env_value(key: &str) -> Option<String> {
+    env::var_os(key).map(|value| value.to_string_lossy().into_owned())
+}
+
+fn set_string_from_env(target: &mut String, key: &str) {
+    if let Some(value) = env_value(key) {
+        *target = value;
+    }
+}
+
+fn set_u16_from_env(target: &mut u16, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(value) = env_value(key) {
+        *target = value.parse()?;
+    }
+    Ok(())
+}
+
+/// Parse `user:pass@host:port` into a `ProxyListenerConfig`.
+fn parse_listener_uri(uri: &str, default_name: &str) -> Option<ProxyListenerConfig> {
+    let (creds, listen) = uri.rsplit_once('@')?;
+    let (username, password) = creds.split_once(':')?;
+    if username.is_empty() || password.is_empty() || listen.is_empty() {
+        return None;
+    }
+    Some(ProxyListenerConfig {
+        name: default_name.to_string(),
+        listen: listen.to_string(),
+        username: username.to_string(),
+        password: password.to_string(),
+    })
 }

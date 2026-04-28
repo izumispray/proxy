@@ -110,6 +110,13 @@ timeout_secs = 600
 [subscription]
 auto_refresh_interval_mins = 0
 orphaned_valid_grace_hours = 24
+
+# 也可通过环境变量配置: ZENPROXY_PROXY_LISTENER=myuser:mypass@0.0.0.0:1080
+# [[proxy_listener]]
+# name = "default"
+# listen = "0.0.0.0:1080"
+# username = "myuser"
+# password = "mypassword"
 ```
 
 ### 认证方式
@@ -287,6 +294,66 @@ curl -X POST "https://proxy.mui.moe/api/relay?api_key=xxx&url=https://api.exampl
   -d '{"key": "value"}'
 ```
 
+#### 代理池监听端口（Proxy Pool Listener）
+
+zenproxy 可以作为标准的 SOCKS5 / HTTP 代理服务器使用，每次连接自动从代理池随机选择一个节点，实现代理轮换。单个端口同时支持 SOCKS5 和 HTTP CONNECT 协议（自动检测）。
+
+**配置方式（二选一）：**
+
+环境变量（推荐，格式 `user:pass@host:port`）：
+
+```env
+ZENPROXY_PROXY_LISTENER=myuser:mypass@0.0.0.0:1080
+```
+
+或 `config.toml`：
+
+```toml
+[[proxy_listener]]
+name = "default"
+listen = "0.0.0.0:1080"
+username = "myuser"
+password = "mypassword"
+```
+
+> 支持多个 listener：`ZENPROXY_PROXY_LISTENER_1`、`ZENPROXY_PROXY_LISTENER_2`、…（最多 10 个）
+
+**鉴权格式：** 标准代理鉴权（SOCKS5 用户名密码 / HTTP Proxy-Authorization Basic）
+
+**代理过滤：** 通过用户名后缀动态指定过滤条件，格式为 `{base_user}-{key}-{value}-{flag}`：
+
+| 后缀 | 说明 | 示例 |
+|------|------|------|
+| `-country-XX` | 指定国家代码 | `myuser-country-US` |
+| `-residential` | 仅住宅 IP | `myuser-residential` |
+| `-chatgpt` | ChatGPT 可访问 | `myuser-chatgpt` |
+| `-google` | Google 可访问 | `myuser-google` |
+| `-type-TYPE` | 指定代理类型 | `myuser-type-vmess` |
+
+后缀可自由组合：`myuser-country-US-residential-chatgpt`
+
+**使用示例：**
+
+```bash
+# SOCKS5 — 随机代理
+curl -x socks5://myuser:mypass@proxy.example.com:1080 https://httpbin.org/ip
+
+# SOCKS5 — 美国住宅代理
+curl -x socks5://myuser-country-US-residential:mypass@proxy.example.com:1080 https://httpbin.org/ip
+
+# HTTP CONNECT — ChatGPT 可用代理
+curl -x http://myuser-chatgpt:mypass@proxy.example.com:1080 https://httpbin.org/ip
+
+# 多次请求验证 IP 轮换
+for i in $(seq 1 5); do
+  curl -s -x socks5://myuser:mypass@proxy.example.com:1080 https://httpbin.org/ip
+done
+```
+
+> **重试机制：** 连接失败时自动重试最多 3 个不同的代理节点。
+
+> **Docker 部署：** 需要在 `docker-compose.yml` 的 zenproxy 服务中手动添加端口映射（如 `- "1080:1080"`），并将 `ZENPROXY_PROXY_LISTENER` 环境变量传入容器。
+
 #### 代理列表（/api/proxies）
 
 ```
@@ -366,6 +433,17 @@ GET /api/proxies?api_key=xxx
 | 风险评分 | ip-api.com | proxy + hosting 综合评分 |
 
 ### 服务端部署
+
+#### Docker Compose
+
+Compose 内置 Caddy 反代和 PostgreSQL。宿主机只发布 Caddy 的 `80/443` 端口，`zenproxy:3000` 和 `postgres:5432` 只在 Docker 网络内访问。
+
+```bash
+cp .env.example .env
+# 编辑 .env：生产环境建议设置 CADDY_SITE_ADDRESS=proxy.example.com
+# 并将 ZENPROXY_OAUTH_REDIRECT_URI 改为 https://proxy.example.com/api/auth/callback
+docker compose up -d --build
+```
 
 #### 编译
 

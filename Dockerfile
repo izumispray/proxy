@@ -3,7 +3,6 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY README.md ./README.md
 COPY src ./src
-COPY config.toml ./config.toml
 COPY config.toml.example ./config.toml.example
 RUN cargo build --release && strip target/release/zenproxy
 
@@ -22,8 +21,8 @@ WORKDIR /app
 COPY --from=zenproxy-builder /app/target/release/zenproxy /app/zenproxy
 COPY --from=zenproxy-builder /app/target/release/migrate_sqlite_to_postgres /app/migrate_sqlite_to_postgres
 COPY --from=singbox-builder /out/sing-box /usr/local/bin/sing-box
-COPY config.toml /app/config.toml
+COPY config.toml.example /app/config.toml
 RUN mkdir -p /app/data \
     && chmod +x /app/zenproxy /app/migrate_sqlite_to_postgres /usr/local/bin/sing-box
-EXPOSE 3000
+EXPOSE 3000 1080
 CMD ["./zenproxy"]

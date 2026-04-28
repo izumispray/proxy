@@ -43,3 +43,15 @@ timeout_secs = 600
 [subscription]
 auto_refresh_interval_mins = 0
 orphaned_valid_grace_hours = 24
+
+# Proxy pool listeners (SOCKS5+HTTP auto-detect on same port)
+# Can also be configured via env: ZENPROXY_PROXY_LISTENER=user:pass@0.0.0.0:1080
+# Filters are encoded in the username at connect time:
+#   user-country-US-residential:pass → US residential proxy
+#   user-chatgpt-google:pass → ChatGPT+Google accessible proxy
+#
+# [[proxy_listener]]
+# name = "default"
+# listen = "0.0.0.0:1080"
+# username = "myuser"
+# password = "mypassword"

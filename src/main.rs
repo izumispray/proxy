@@ -5,6 +5,7 @@ mod db;
 mod error;
 mod parser;
 mod pool;
+mod proxy_listener;
 mod quality;
 mod singbox;
 
@@ -118,6 +119,9 @@ async fn main() {
 
     // Start background tasks
     start_background_tasks(state.clone()).await;
+
+    // Start proxy pool listeners (SOCKS5/HTTP)
+    proxy_listener::start_proxy_listeners(state.clone());
 
     // Build router
     let app = api::router(state.clone());

@@ -1,22 +1,78 @@
 services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: zenproxy-caddy
+    restart: unless-stopped
+    depends_on:
+      - zenproxy
+    environment:
+      CADDY_SITE_ADDRESS: "${CADDY_SITE_ADDRESS:-http://localhost}"
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - ingress
+      - backend
+
   zenproxy:
     build:
       context: .
       dockerfile: Dockerfile
+      network: host
     container_name: zenproxy
     restart: unless-stopped
     init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      RUST_LOG: zenproxy=info,tower_http=info
+      RUST_LOG: "${RUST_LOG:-zenproxy=info,tower_http=info}"
+      ZENPROXY_DATABASE_URL: "postgresql://${POSTGRES_USER:-zenproxy}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-zenproxy}"
+      ZENPROXY_ADMIN_PASSWORD: "${ZENPROXY_ADMIN_PASSWORD:-change-me}"
+      ZENPROXY_OAUTH_CLIENT_ID: "${ZENPROXY_OAUTH_CLIENT_ID:-}"
+      ZENPROXY_OAUTH_CLIENT_SECRET: "${ZENPROXY_OAUTH_CLIENT_SECRET:-}"
+      ZENPROXY_OAUTH_REDIRECT_URI: "${ZENPROXY_OAUTH_REDIRECT_URI:-http://localhost/api/auth/callback}"
+      ZENPROXY_OAUTH_REQUIRED_GUILD_ID: "${ZENPROXY_OAUTH_REQUIRED_GUILD_ID:-}"
+      ZENPROXY_PROXY_LISTENER: "${ZENPROXY_PROXY_LISTENER:-}"
     expose:
       - "3000"
     volumes:
-      - ./config.toml:/app/config.toml:ro
-      - ./data:/app/data
+      - zenproxy_data:/app/data
     networks:
-      - new-api-net
+      - backend
+      - egress
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: zenproxy-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-zenproxy}
+      POSTGRES_USER: ${POSTGRES_USER:-zenproxy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-zenproxy} -d ${POSTGRES_DB:-zenproxy}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
 
 networks:
-  new-api-net:
-    external: true
-    name: newnewapi_new-api-net
+  ingress:
+  backend:
+    internal: true
+  egress:
+
+volumes:
+  caddy_data:
+  caddy_config:
+  postgres_data:
+  zenproxy_data:
