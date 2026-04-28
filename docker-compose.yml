@@ -39,6 +39,8 @@ services:
       ZENPROXY_OAUTH_REDIRECT_URI: "${ZENPROXY_OAUTH_REDIRECT_URI:-http://localhost/api/auth/callback}"
       ZENPROXY_OAUTH_REQUIRED_GUILD_ID: "${ZENPROXY_OAUTH_REQUIRED_GUILD_ID:-}"
       ZENPROXY_PROXY_LISTENER: "${ZENPROXY_PROXY_LISTENER:-}"
+    ports:
+      - "1080:1080"
     expose:
       - "3000"
     volumes:
