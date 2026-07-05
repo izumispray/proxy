@@ -76,7 +76,7 @@ async fn run_listener(
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     state: Arc<AppState>,
     cfg: Arc<crate::config::ProxyListenerConfig>,
 ) -> Result<(), String> {
@@ -624,6 +624,7 @@ async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), String
     stream
         .read_exact(buf)
         .await
+        .map(|_| ())
         .map_err(|e| format!("read: {e}"))
 }
 
