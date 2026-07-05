@@ -202,12 +202,14 @@ async fn record_relay_failure(
         state.binding_usage.remove(&proxy.id);
         state.pool.remove(&proxy.id);
         state.db.delete_proxy(&proxy.id).ok();
+        crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
         return;
     }
 
     state.pool.increment_error(&proxy.id);
     state.pool.set_status(&proxy.id, ProxyStatus::Untested);
     state.db.mark_proxy_relay_failed(&proxy.id, error).ok();
+    crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
 }
 
 fn should_delete_proxy_after_relay_failure(error: &str) -> bool {

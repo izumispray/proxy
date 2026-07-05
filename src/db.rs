@@ -549,6 +549,39 @@ impl Database {
         })
     }
 
+    pub fn get_valid_export_proxies(
+        &self,
+        proxy_type: Option<&str>,
+    ) -> Result<Vec<ProxyRow>, postgres::Error> {
+        self.with_conn(|conn| {
+            let rows = if let Some(proxy_type) = proxy_type {
+                conn.query(
+                    "SELECT id, subscription_id, name, proxy_type, server, port, config_json,
+                            is_valid, local_port, error_count, last_error, last_validated,
+                            created_at, updated_at, orphaned_at
+                     FROM proxies
+                     WHERE is_valid = TRUE
+                       AND orphaned_at IS NULL
+                       AND proxy_type = $1
+                     ORDER BY error_count ASC, last_validated DESC NULLS LAST, updated_at DESC, name ASC",
+                    &[&proxy_type],
+                )?
+            } else {
+                conn.query(
+                    "SELECT id, subscription_id, name, proxy_type, server, port, config_json,
+                            is_valid, local_port, error_count, last_error, last_validated,
+                            created_at, updated_at, orphaned_at
+                     FROM proxies
+                     WHERE is_valid = TRUE
+                       AND orphaned_at IS NULL
+                     ORDER BY proxy_type ASC, error_count ASC, last_validated DESC NULLS LAST, updated_at DESC, name ASC",
+                    &[],
+                )?
+            };
+            Ok(rows.iter().map(proxy_from_row).collect())
+        })
+    }
+
     pub fn get_proxy_record(
         &self,
         id: &str,

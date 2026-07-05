@@ -151,6 +151,7 @@ pub async fn add_subscription(
     }
 
     state.db.insert_proxies_batch(&proxy_rows)?;
+    crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
 
     let added = proxy_rows.len();
 
@@ -192,6 +193,7 @@ pub async fn delete_subscription(
 
     state.pool.remove_by_subscription(&id);
     state.db.delete_subscription(&id)?;
+    crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
 
     // Sync bindings in background
     let state2 = state.clone();
@@ -383,6 +385,7 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
         .db
         .mark_subscription_refreshed(&sub.id, total as i32)
         .map_err(|e| format!("Failed to update proxy count: {e}"))?;
+    crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
 
     if removed_invalid > 0 || orphaned_valid > 0 || orphaned_untested > 0 {
         tracing::info!(

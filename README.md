@@ -110,6 +110,7 @@ timeout_secs = 600
 [subscription]
 auto_refresh_interval_mins = 0
 orphaned_valid_grace_hours = 24
+export_cache_secs = 60
 
 # 也可通过环境变量配置: ZENPROXY_PROXY_LISTENER=myuser:mypass@0.0.0.0:1080
 # [[proxy_listener]]
@@ -361,6 +362,21 @@ GET /api/proxies?api_key=xxx
 ```
 
 返回所有代理及统计信息，包含质检数据。
+
+#### 客户端订阅（/sub）
+
+订阅链接只返回已验活且仍属于当前订阅源的代理，鉴权 token 复用 `server.admin_password`。
+
+```
+https://proxy.mui.moe/sub/{admin_password}/all
+https://proxy.mui.moe/sub/{admin_password}/vless/clash.yaml
+https://proxy.mui.moe/sub/{admin_password}/vmess/clash.yaml
+https://proxy.mui.moe/sub/{admin_password}/trojan/clash.yaml
+```
+
+`all` 返回全部协议类型；也可以使用 `vless`、`vmess`、`trojan`、`shadowsocks`、`hysteria2`、`socks`、`http` 按协议筛选。默认输出 Clash YAML，`/clash.yaml` 后缀用于显式区分客户端格式。
+
+服务端会在验证、刷新订阅、删除代理或 relay 将代理降级时清空订阅缓存；平时生成结果按 `[subscription] export_cache_secs` 缓存，默认 60 秒，设为 0 表示每次实时生成。
 
 #### 管理接口
 

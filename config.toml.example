@@ -43,6 +43,7 @@ timeout_secs = 600
 [subscription]
 auto_refresh_interval_mins = 0
 orphaned_valid_grace_hours = 24
+export_cache_secs = 60
 
 # Proxy pool listeners (SOCKS5+HTTP auto-detect on same port)
 # Can also be configured via env: ZENPROXY_PROXY_LISTENER=user:pass@0.0.0.0:1080

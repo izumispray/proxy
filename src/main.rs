@@ -27,6 +27,8 @@ pub struct AppState {
     pub binding_usage: DashMap<String, bindings::BindingUsage>,
     /// Cached reqwest::Client per proxy local_port — avoids rebuilding per request.
     pub relay_clients: DashMap<u16, reqwest::Client>,
+    /// Cached generated client subscription bodies keyed by selector/format.
+    pub subscription_export_cache: DashMap<String, SubscriptionExportCacheEntry>,
     /// Auth cache: (api_key | session_id) → (User, expires_at_instant).
     pub auth_cache: DashMap<String, (User, tokio::time::Instant)>,
     /// Serializes binding changes during validation/quality work.
@@ -35,6 +37,13 @@ pub struct AppState {
     pub validation_running: AtomicBool,
     /// Prevents duplicate quality-check runs from being queued/spawned.
     pub quality_running: AtomicBool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubscriptionExportCacheEntry {
+    pub body: String,
+    pub proxy_count: usize,
+    pub expires_at: tokio::time::Instant,
 }
 
 #[tokio::main]
@@ -109,6 +118,7 @@ async fn main() {
         singbox,
         binding_usage: DashMap::new(),
         relay_clients: DashMap::new(),
+        subscription_export_cache: DashMap::new(),
         auth_cache: DashMap::new(),
         validation_lock: Mutex::new(()),
         validation_running: AtomicBool::new(false),

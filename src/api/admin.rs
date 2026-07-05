@@ -36,6 +36,7 @@ pub async fn delete_proxy(
     state.binding_usage.remove(&id);
     state.pool.remove(&id);
     state.db.delete_proxy(&id)?;
+    crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     Ok(Json(json!({ "message": "Proxy deleted" })))
 }
 
@@ -61,6 +62,9 @@ pub async fn cleanup_proxies(
     for proxy in &targets {
         state.binding_usage.remove(&proxy.id);
         state.pool.remove(&proxy.id);
+    }
+    if count > 0 {
+        crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     }
 
     Ok(Json(json!({

@@ -3,6 +3,7 @@ pub mod auth;
 pub mod client_fetch;
 pub mod fetch;
 pub mod relay;
+pub mod sub_export;
 pub mod subscription;
 
 use crate::AppState;
@@ -69,6 +70,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)); // 10 MB
 
+    // Public client subscription routes — protected by the path token.
+    let subscription_export_routes = Router::new()
+        .route(
+            "/sub/:token/:selector",
+            get(sub_export::export_subscription_default),
+        )
+        .route(
+            "/sub/:token/:selector/clash.yaml",
+            get(sub_export::export_subscription_clash),
+        );
+
     // Page routes — no auth
     let page_routes = Router::new()
         .route("/", get(user_page))
@@ -79,6 +91,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(auth_routes)
         .merge(admin_routes)
         .merge(fetch_relay_routes)
+        .merge(subscription_export_routes)
         .merge(page_routes)
         .layer(CorsLayer::permissive())
         .with_state(state)

@@ -146,6 +146,8 @@ pub struct SubscriptionConfig {
     pub auto_refresh_interval_mins: u64, // legacy/global default for subscriptions without explicit interval
     #[serde(default = "default_orphaned_valid_grace_hours")]
     pub orphaned_valid_grace_hours: u64,
+    #[serde(default = "default_export_cache_secs")]
+    pub export_cache_secs: u64,
 }
 
 impl Default for SubscriptionConfig {
@@ -153,12 +155,17 @@ impl Default for SubscriptionConfig {
         Self {
             auto_refresh_interval_mins: 0,
             orphaned_valid_grace_hours: default_orphaned_valid_grace_hours(),
+            export_cache_secs: default_export_cache_secs(),
         }
     }
 }
 
 fn default_orphaned_valid_grace_hours() -> u64 {
     24
+}
+
+fn default_export_cache_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

@@ -227,6 +227,7 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
 
     // Final assignment: normal mode (Valid gets priority for serving traffic)
     let _ = crate::api::subscription::sync_proxy_bindings(&state, SyncMode::Normal).await;
+    crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
 
     let valid = state.db.count_valid_proxies().unwrap_or(0);
     let total = state.db.count_all_proxies().unwrap_or(0);
