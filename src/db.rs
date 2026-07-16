@@ -1,5 +1,6 @@
 use postgres::types::ToSql;
 use postgres::{Client, Config, NoTls, Row};
+use base64::Engine;
 use std::sync::Mutex;
 
 pub struct Database {
@@ -126,6 +127,8 @@ pub struct Session {
 pub struct ProxyListQuery {
     pub page: usize,
     pub page_size: usize,
+    pub cursor: Option<String>,
+    pub direction: Option<String>,
     pub search: Option<String>,
     pub status: Option<String>,
     pub proxy_type: Option<String>,
@@ -156,6 +159,19 @@ pub struct ProxyListPage {
     pub page: usize,
     pub page_size: usize,
     pub total_pages: usize,
+    pub next_cursor: Option<String>,
+    pub prev_cursor: Option<String>,
+    pub has_next: bool,
+    pub has_previous: bool,
+    pub counts_available: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ProxyListCursor {
+    sort: String,
+    dir: String,
+    value: String,
+    id: String,
 }
 
 impl Database {
@@ -222,6 +238,8 @@ impl Database {
                 );
 
                 ALTER TABLE proxies ADD COLUMN IF NOT EXISTS orphaned_at TEXT;
+                ALTER TABLE proxies ADD COLUMN IF NOT EXISTS binding_failure_count INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE proxies ADD COLUMN IF NOT EXISTS last_binding_failure TEXT;
                 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS refresh_interval_mins INTEGER;
                 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS last_refresh_at TEXT;
 
@@ -283,6 +301,9 @@ impl Database {
                     ON proxies(error_count ASC, updated_at DESC)
                     WHERE is_valid = FALSE AND last_validated IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_proxies_orphaned_at ON proxies(orphaned_at);
+                CREATE INDEX IF NOT EXISTS idx_proxies_binding_retry
+                    ON proxies(last_binding_failure)
+                    WHERE binding_failure_count > 0;
                 CREATE INDEX IF NOT EXISTS idx_proxy_quality_country ON proxy_quality(country);
                 CREATE INDEX IF NOT EXISTS idx_proxy_quality_chatgpt ON proxy_quality(chatgpt_accessible);
                 CREATE INDEX IF NOT EXISTS idx_proxy_quality_google ON proxy_quality(google_accessible);
@@ -758,6 +779,160 @@ impl Database {
         })
     }
 
+    /// Return a fair validation batch made from independent cohorts. Keeping the
+    /// cohorts separate prevents a large stream of new subscriptions from
+    /// starving valid rechecks or cooled-down invalid retries.
+    pub fn get_validation_proxy_records(
+        &self,
+        new_limit: usize,
+        valid_limit: usize,
+        invalid_limit: usize,
+        valid_before: &str,
+        retry_before: &str,
+        orphaned_before: &str,
+        error_threshold: u32,
+    ) -> Result<Vec<(ProxyRow, Option<ProxyQuality>)>, postgres::Error> {
+        let columns = "p.id, p.subscription_id, p.name, p.proxy_type, p.server, p.port, p.config_json,
+                       p.is_valid, p.local_port, p.error_count, p.last_error, p.last_validated,
+                       p.created_at, p.updated_at, p.orphaned_at,
+                       q.proxy_id, q.ip_address, q.country, q.ip_type, q.is_residential,
+                       q.chatgpt_accessible, q.google_accessible, q.risk_score, q.risk_level,
+                       q.extra_json, q.checked_at";
+        let new_limit = new_limit as i64;
+        let valid_limit = valid_limit as i64;
+        let invalid_limit = invalid_limit as i64;
+        let error_threshold = error_threshold as i32;
+
+        self.with_conn(|conn| {
+            let mut records = Vec::with_capacity(
+                new_limit.max(0) as usize
+                    + valid_limit.max(0) as usize
+                    + invalid_limit.max(0) as usize,
+            );
+
+            if new_limit > 0 {
+                let sql = format!(
+                    "SELECT {columns}
+                     FROM proxies p
+                     LEFT JOIN proxy_quality q ON q.proxy_id = p.id
+                     WHERE p.is_valid = FALSE
+                       AND p.last_validated IS NULL
+                       AND p.error_count = 0
+                       AND p.orphaned_at IS NULL
+                       AND (p.last_binding_failure IS NULL OR p.last_binding_failure <= $1)
+                     ORDER BY p.created_at ASC, p.id ASC
+                     LIMIT $2"
+                );
+                records.extend(
+                    conn.query(&sql, &[&retry_before, &new_limit])?
+                        .iter()
+                        .map(proxy_record_from_join_row),
+                );
+            }
+
+            if valid_limit > 0 {
+                let sql = format!(
+                    "SELECT {columns}
+                     FROM proxies p
+                     LEFT JOIN proxy_quality q ON q.proxy_id = p.id
+                     WHERE p.is_valid = TRUE
+                       AND (
+                            (p.orphaned_at IS NULL AND p.last_validated <= $1)
+                            OR
+                            (p.orphaned_at IS NOT NULL
+                             AND p.orphaned_at <= $2
+                             AND p.last_validated <= $2)
+                       )
+                       AND (p.last_binding_failure IS NULL OR p.last_binding_failure <= $3)
+                     ORDER BY p.last_validated ASC NULLS FIRST, p.updated_at ASC, p.id ASC
+                     LIMIT $4"
+                );
+                records.extend(
+                    conn.query(
+                        &sql,
+                        &[&valid_before, &orphaned_before, &retry_before, &valid_limit],
+                    )?
+                        .iter()
+                        .map(proxy_record_from_join_row),
+                );
+            }
+
+            if invalid_limit > 0 {
+                let sql = format!(
+                    "SELECT {columns}
+                     FROM proxies p
+                     LEFT JOIN proxy_quality q ON q.proxy_id = p.id
+                     WHERE p.is_valid = FALSE
+                       AND p.orphaned_at IS NULL
+                       AND p.error_count < $1
+                       AND (p.last_validated IS NOT NULL OR p.error_count > 0)
+                       AND p.updated_at <= $2
+                       AND (p.last_binding_failure IS NULL OR p.last_binding_failure <= $2)
+                     ORDER BY p.error_count ASC, p.updated_at ASC, p.id ASC
+                     LIMIT $3"
+                );
+                records.extend(
+                    conn.query(
+                        &sql,
+                        &[&error_threshold, &retry_before, &invalid_limit],
+                    )?
+                    .iter()
+                    .map(proxy_record_from_join_row),
+                );
+            }
+
+            // Keep the configured cohorts fair, but do not leave validation
+            // ports idle when the recheck/retry cohorts are temporarily small.
+            // New inventory is normally the large backlog, so it absorbs only
+            // the unused quota after the reserved cohorts were queried.
+            let target = (new_limit + valid_limit + invalid_limit) as usize;
+            let missing = target.saturating_sub(records.len()) as i64;
+            if missing > 0 && new_limit > 0 {
+                let sql = format!(
+                    "SELECT {columns}
+                     FROM proxies p
+                     LEFT JOIN proxy_quality q ON q.proxy_id = p.id
+                     WHERE p.is_valid = FALSE
+                       AND p.last_validated IS NULL
+                       AND p.error_count = 0
+                       AND p.orphaned_at IS NULL
+                       AND (p.last_binding_failure IS NULL OR p.last_binding_failure <= $1)
+                     ORDER BY p.created_at ASC, p.id ASC
+                     LIMIT $2 OFFSET $3"
+                );
+                records.extend(
+                    conn.query(&sql, &[&retry_before, &missing, &new_limit])?
+                        .iter()
+                        .map(proxy_record_from_join_row),
+                );
+            }
+
+            Ok(records)
+        })
+    }
+
+    pub fn get_stale_valid_recheck_ids(
+        &self,
+        validated_before: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, postgres::Error> {
+        let limit = limit as i64;
+        self.with_conn(|conn| {
+            let rows = conn.query(
+                "SELECT id
+                 FROM proxies
+                 WHERE is_valid = TRUE
+                   AND orphaned_at IS NULL
+                   AND error_count = 0
+                   AND (last_validated IS NULL OR last_validated <= $1)
+                 ORDER BY last_validated ASC NULLS FIRST, updated_at ASC
+                 LIMIT $2",
+                &[&validated_before, &limit],
+            )?;
+            Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+        })
+    }
+
     pub fn get_invalid_retry_ids(
         &self,
         max_error_count: u32,
@@ -866,8 +1041,7 @@ impl Database {
         query: &ProxyListQuery,
     ) -> Result<ProxyListPage, postgres::Error> {
         let page_size = query.page_size.clamp(1, 200);
-        let page = query.page.max(1);
-        let offset = ((page - 1) * page_size) as i64;
+        let requested_page = query.page.max(1);
 
         let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
         let where_clause = build_proxy_list_where(query, &mut params);
@@ -877,40 +1051,85 @@ impl Database {
         } else {
             "ASC"
         };
+        let sort_key = proxy_list_sort_key(query.sort.as_deref());
+        let cursor = query
+            .cursor
+            .as_deref()
+            .and_then(decode_proxy_list_cursor)
+            .filter(|cursor| {
+                cursor.sort == sort_key
+                    && cursor.dir.eq_ignore_ascii_case(dir)
+                    && proxy_cursor_value_is_valid(cursor, sort_key)
+            });
+        let backwards = cursor.is_some()
+            && matches!(query.direction.as_deref(), Some("prev") | Some("previous"));
 
         let count_params = params;
-        let filtered = self.with_conn(|conn| {
-            let count_refs: Vec<&(dyn ToSql + Sync)> =
-                count_params.iter().map(|p| &**p as &(dyn ToSql + Sync)).collect();
-            let sql = format!(
-                "SELECT COUNT(*)
-                 FROM proxies p
-                 LEFT JOIN proxy_quality q ON q.proxy_id = p.id
-                 {where_clause}"
-            );
-            let count: i64 = conn.query_one(&sql, &count_refs)?.get(0);
-            Ok(count as usize)
-        })?;
+        // Cursor requests already have their totals from the first page. Avoid
+        // repeating a million-row COUNT on every next/previous click.
+        let counts_available = cursor.is_none();
+        let (filtered, total) = if counts_available {
+            self.with_conn(|conn| {
+                let count_refs: Vec<&(dyn ToSql + Sync)> = count_params
+                    .iter()
+                    .map(|p| &**p as &(dyn ToSql + Sync))
+                    .collect();
+                let sql = format!(
+                    "SELECT
+                        COUNT(*) AS filtered,
+                        (SELECT COUNT(*) FROM proxies WHERE orphaned_at IS NULL) AS total
+                     FROM proxies p
+                     LEFT JOIN proxy_quality q ON q.proxy_id = p.id
+                     {where_clause}"
+                );
+                let row = conn.query_one(&sql, &count_refs)?;
+                let filtered: i64 = row.get("filtered");
+                let total: i64 = row.get("total");
+                Ok((filtered as usize, total as usize))
+            })?
+        } else {
+            (0, 0)
+        };
 
         // The admin/user list represents the current subscription contents.
         // Orphaned rows are retained internally for smooth refresh/rechecking,
         // but are not eligible for export and must not inflate the UI totals.
-        let total = self.with_conn(|conn| {
-            let count: i64 = conn
-                .query_one("SELECT COUNT(*) FROM proxies WHERE orphaned_at IS NULL", &[])?
-                .get(0);
-            Ok(count as usize)
-        })?;
         let total_pages = if filtered == 0 {
             0
         } else {
             filtered.div_ceil(page_size)
         };
+        // A filter change or deletion can make the requested page disappear.
+        // Return the last available page instead of a misleading empty result.
+        let page = requested_page.min(total_pages.max(1));
+        let offset = (page - 1)
+            .saturating_mul(page_size)
+            .min(i64::MAX as usize) as i64;
 
         let mut select_params = count_params;
-        select_params.push(Box::new(page_size as i64));
-        select_params.push(Box::new(offset));
-        let limit_idx = select_params.len() - 1;
+        let cursor_clause = cursor
+            .as_ref()
+            .map(|cursor| build_proxy_cursor_clause(
+                cursor,
+                sort_expr,
+                sort_key,
+                dir,
+                backwards,
+                &mut select_params,
+            ))
+            .unwrap_or_default();
+        // Ask for one extra row so has_next/has_previous does not need another query.
+        select_params.push(Box::new((page_size + 1) as i64));
+        let limit_idx = select_params.len();
+        let query_dir = if backwards {
+            if dir == "ASC" { "DESC" } else { "ASC" }
+        } else {
+            dir
+        };
+        let id_dir = if backwards { "DESC" } else { "ASC" };
+        // OFFSET remains only for legacy callers that do not send a cursor.
+        let legacy_offset = if cursor.is_none() { offset } else { 0 };
+        select_params.push(Box::new(legacy_offset));
         let offset_idx = select_params.len();
 
         self.with_conn(|conn| {
@@ -922,15 +1141,35 @@ impl Database {
                     p.error_count, p.is_valid, p.last_validated,
                     q.proxy_id, q.ip_address, q.country, q.ip_type, q.is_residential,
                     q.chatgpt_accessible, q.google_accessible, q.risk_score, q.risk_level,
-                    q.extra_json, q.checked_at
+                    q.extra_json, q.checked_at,
+                    ({sort_expr})::text AS cursor_value
                  FROM proxies p
                  LEFT JOIN proxy_quality q ON q.proxy_id = p.id
-                 {where_clause}
-                 ORDER BY {sort_expr} {dir}, p.id ASC
+                 {where_clause} {cursor_clause}
+                 ORDER BY {sort_expr} {query_dir}, p.id {id_dir}
                  LIMIT ${limit_idx} OFFSET ${offset_idx}"
             );
             let rows = conn.query(&sql, &param_refs)?;
-            let proxies = rows.iter().map(proxy_list_item_from_row).collect();
+            let has_extra = rows.len() > page_size;
+            let visible_rows = &rows[..rows.len().min(page_size)];
+            let mut proxies: Vec<_> = visible_rows.iter().map(proxy_list_item_from_row).collect();
+            let mut cursor_rows: Vec<_> = visible_rows.iter().collect();
+            if backwards {
+                proxies.reverse();
+                cursor_rows.reverse();
+            }
+            let cursor_for = |row: &&Row| {
+                encode_proxy_list_cursor(&ProxyListCursor {
+                    sort: sort_key.to_string(),
+                    dir: dir.to_string(),
+                    value: row.get("cursor_value"),
+                    id: row.get("id"),
+                })
+            };
+            let next_cursor = cursor_rows.last().and_then(cursor_for);
+            let prev_cursor = cursor_rows.first().and_then(cursor_for);
+            let has_next = if backwards { cursor.is_some() } else { has_extra };
+            let has_previous = if backwards { has_extra } else { cursor.is_some() };
             Ok(ProxyListPage {
                 proxies,
                 total,
@@ -938,6 +1177,11 @@ impl Database {
                 page,
                 page_size,
                 total_pages,
+                next_cursor,
+                prev_cursor,
+                has_next,
+                has_previous,
+                counts_available,
             })
         })
     }
@@ -1077,6 +1321,68 @@ impl Database {
                  SET name = $1, config_json = $2, orphaned_at = NULL, updated_at = $3
                  WHERE id = $4",
                 &[&name, &config_json, &now, &id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Reset health metadata when credentials or transport settings change for
+    /// an otherwise identical endpoint.
+    pub fn reset_proxy_after_config_change(
+        &self,
+        id: &str,
+        name: &str,
+        config_json: &str,
+    ) -> Result<(), postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let mut tx = conn.transaction()?;
+            tx.execute("DELETE FROM proxy_quality WHERE proxy_id = $1", &[&id])?;
+            tx.execute(
+                "UPDATE proxies
+                 SET name = $1, config_json = $2, is_valid = FALSE,
+                     local_port = NULL, error_count = 0, last_error = NULL,
+                     last_validated = NULL, orphaned_at = NULL,
+                     binding_failure_count = 0, last_binding_failure = NULL,
+                     updated_at = $3
+                 WHERE id = $4",
+                &[&name, &config_json, &now, &id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Persist a local binding failure separately from remote validation errors.
+    pub fn record_proxy_binding_failure(&self, id: &str) -> Result<u32, postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let row = conn.query_one(
+                "UPDATE proxies
+                 SET binding_failure_count = binding_failure_count + 1,
+                     last_binding_failure = $1,
+                     last_error = 'sing-box binding failed',
+                     local_port = NULL
+                 WHERE id = $2
+                 RETURNING binding_failure_count",
+                &[&now, &id],
+            )?;
+            let failures: i32 = row.get(0);
+            Ok(failures.max(0) as u32)
+        })
+    }
+
+    pub fn clear_proxy_binding_failures(&self, id: &str) -> Result<(), postgres::Error> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE proxies
+                 SET binding_failure_count = 0, last_binding_failure = NULL,
+                     last_error = CASE
+                         WHEN last_error = 'sing-box binding failed' THEN NULL
+                         ELSE last_error
+                     END
+                 WHERE id = $1 AND binding_failure_count > 0",
+                &[&id],
             )?;
             Ok(())
         })
@@ -1753,11 +2059,79 @@ fn proxy_list_sort_expr(sort: Option<&str>) -> &'static str {
     }
 }
 
+fn proxy_list_sort_key(sort: Option<&str>) -> &'static str {
+    match sort {
+        Some("type") => "type",
+        Some("server") => "server",
+        Some("status") | Some("is_valid") => "status",
+        Some("error_count") => "error_count",
+        Some("country") => "country",
+        Some("risk") => "risk",
+        _ => "name",
+    }
+}
+
+fn encode_proxy_list_cursor(cursor: &ProxyListCursor) -> Option<String> {
+    let bytes = serde_json::to_vec(cursor).ok()?;
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_proxy_list_cursor(encoded: &str) -> Option<ProxyListCursor> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn build_proxy_cursor_clause(
+    cursor: &ProxyListCursor,
+    sort_expr: &str,
+    sort_key: &str,
+    dir: &str,
+    backwards: bool,
+    params: &mut Vec<Box<dyn ToSql + Sync>>,
+) -> String {
+    match sort_key {
+        "status" | "error_count" => {
+            let Ok(value) = cursor.value.parse::<i32>() else {
+                return String::new();
+            };
+            params.push(Box::new(value));
+        }
+        "risk" => {
+            let Ok(value) = cursor.value.parse::<f64>() else {
+                return String::new();
+            };
+            params.push(Box::new(value));
+        }
+        _ => params.push(Box::new(cursor.value.clone())),
+    }
+    let value_idx = params.len();
+    params.push(Box::new(cursor.id.clone()));
+    let id_idx = params.len();
+    let value_op = if (dir == "ASC") ^ backwards { ">" } else { "<" };
+    let id_op = if backwards { "<" } else { ">" };
+    format!(
+        "AND (({sort_expr}) {value_op} ${value_idx} OR (({sort_expr}) = ${value_idx} AND p.id {id_op} ${id_idx}))"
+    )
+}
+
+fn proxy_cursor_value_is_valid(cursor: &ProxyListCursor, sort_key: &str) -> bool {
+    match sort_key {
+        "status" | "error_count" => cursor.value.parse::<i32>().is_ok(),
+        "risk" => cursor
+            .value
+            .parse::<f64>()
+            .is_ok_and(|value| value.is_finite()),
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_fetch_proxy_where, build_proxy_list_where, build_random_valid_proxy_order_by,
-        ProxyListQuery,
+        decode_proxy_list_cursor, encode_proxy_list_cursor, ProxyListCursor, ProxyListQuery,
     };
     use crate::pool::manager::ProxyFilter;
     use postgres::types::ToSql;
@@ -1782,6 +2156,26 @@ mod tests {
 
         assert_eq!(clause, "WHERE p.orphaned_at IS NULL");
         assert!(params.is_empty());
+    }
+
+    #[test]
+    fn proxy_list_cursor_round_trips_opaque_values() {
+        let cursor = ProxyListCursor {
+            sort: "name".to_string(),
+            dir: "ASC".to_string(),
+            value: "节点/東京 + 1".to_string(),
+            id: "proxy-123".to_string(),
+        };
+
+        let encoded = encode_proxy_list_cursor(&cursor).expect("cursor should encode");
+        let decoded = decode_proxy_list_cursor(&encoded).expect("cursor should decode");
+
+        assert_eq!(decoded.sort, cursor.sort);
+        assert_eq!(decoded.dir, cursor.dir);
+        assert_eq!(decoded.value, cursor.value);
+        assert_eq!(decoded.id, cursor.id);
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
     }
 
     #[test]

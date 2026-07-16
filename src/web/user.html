@@ -156,13 +156,13 @@ tr:hover td { background:rgba(108,99,255,.03); }
     </div>
     <div class="filter-bar">
       <input id="f-search" placeholder="搜索名称/服务器/IP..." oninput="queueLoadProxies()">
-      <select id="f-status" onchange="currentPage=1;loadProxies()">
+      <select id="f-status" onchange="resetProxyCursor();loadProxies()">
         <option value="">全部状态</option>
         <option value="valid">有效</option>
         <option value="invalid">无效</option>
         <option value="untested">待检测</option>
       </select>
-      <select id="f-quality" onchange="currentPage=1;loadProxies()">
+      <select id="f-quality" onchange="resetProxyCursor();loadProxies()">
         <option value="">全部质量</option>
         <option value="chatgpt">ChatGPT 可用</option>
         <option value="google">Google 可用</option>
@@ -184,6 +184,7 @@ tr:hover td { background:rgba(108,99,255,.03); }
           <th>ChatGPT</th>
           <th>Google</th>
           <th>住宅</th>
+          <th>质检状态</th>
         </tr></thead>
         <tbody id="proxy-table"></tbody>
       </table>
@@ -243,7 +244,12 @@ const pageSize = 50;
 let proxyTotal = 0;
 let proxyFiltered = 0;
 let proxyTotalPages = 0;
+let proxyNextCursor = null;
+let proxyPrevCursor = null;
+let proxyHasNext = false;
+let proxyHasPrevious = false;
 let proxyFilterTimer = null;
+let proxyLoadSequence = 0;
 
 function toast(msg) {
   const t = document.createElement('div');
@@ -325,10 +331,10 @@ async function regenerateKey() {
 // --- Proxy data ---
 async function loadProxies() {
   if (!currentUser) return;
+  const loadSequence = ++proxyLoadSequence;
   try {
     const params = new URLSearchParams({
       api_key: currentUser.api_key,
-      page: String(currentPage),
       page_size: String(pageSize),
       sort: sortField,
       dir: sortDir,
@@ -339,10 +345,15 @@ async function loadProxies() {
     if (search) params.set('search', search);
     if (status) params.set('status', status);
     if (quality) params.set('quality', quality);
+    if (proxyCursor) {
+      params.set('cursor', proxyCursor);
+      params.set('direction', proxyCursorDirection);
+    }
     const r = await fetch('/api/proxies?' + params.toString());
     const d = await r.json();
-    if (!d) return;
-    document.getElementById('stat-total').textContent = d.total ?? 0;
+    if (!d || loadSequence !== proxyLoadSequence) return;
+    if (!proxyCursor) currentPage = d.page ?? currentPage;
+    if (d.total != null) document.getElementById('stat-total').textContent = d.total;
     document.getElementById('stat-valid').textContent = d.valid ?? 0;
     document.getElementById('stat-invalid').textContent = d.invalid ?? 0;
     document.getElementById('stat-untested').textContent = d.untested ?? 0;
@@ -351,9 +362,13 @@ async function loadProxies() {
     document.getElementById('stat-google').textContent = d.google_accessible ?? 0;
     document.getElementById('stat-residential').textContent = d.residential ?? 0;
     currentProxies = d.proxies || [];
-    proxyTotal = d.total ?? 0;
-    proxyFiltered = d.filtered ?? proxyTotal;
-    proxyTotalPages = d.total_pages ?? 0;
+    if (d.total != null) proxyTotal = d.total;
+    if (d.filtered != null) proxyFiltered = d.filtered;
+    if (d.total_pages != null) proxyTotalPages = d.total_pages;
+    proxyNextCursor = d.next_cursor || null;
+    proxyPrevCursor = d.prev_cursor || null;
+    proxyHasNext = !!d.has_next;
+    proxyHasPrevious = !!d.has_previous;
     renderProxies();
   } catch(e) {}
 }
@@ -387,6 +402,7 @@ function renderProxies() {
       <td>${q ? (q.chatgpt ? yes : no) : na}</td>
       <td>${q ? (q.google ? yes : no) : na}</td>
       <td>${q ? (q.is_residential ? yes : no) : na}</td>
+      <td>${q ? (q.stale ? '<span class="badge badge-invalid">已过期</span>' : '<span class="badge badge-valid">最新</span>') : na}</td>
     </tr>`;
   }).join('');
 
@@ -395,37 +411,39 @@ function renderProxies() {
 
 function renderPagination(total, totalPages) {
   const container = document.getElementById('proxy-pagination');
-  if (totalPages <= 1) { container.innerHTML = ''; return; }
-  let html = '';
-  html += `<button ${currentPage<=1?'disabled':''} onclick="goPage(1)">&laquo;</button>`;
-  html += `<button ${currentPage<=1?'disabled':''} onclick="goPage(${currentPage-1})">&lsaquo;</button>`;
-  const maxVisible = 7;
-  let startPage = Math.max(1, currentPage - Math.floor(maxVisible/2));
-  let endPage = Math.min(totalPages, startPage + maxVisible - 1);
-  if (endPage - startPage < maxVisible - 1) startPage = Math.max(1, endPage - maxVisible + 1);
-  if (startPage > 1) html += `<span class="page-info">...</span>`;
-  for (let i = startPage; i <= endPage; i++) {
-    html += `<button class="${i===currentPage?'active':''}" onclick="goPage(${i})">${i}</button>`;
-  }
-  if (endPage < totalPages) html += `<span class="page-info">...</span>`;
-  html += `<button ${currentPage>=totalPages?'disabled':''} onclick="goPage(${currentPage+1})">&rsaquo;</button>`;
-  html += `<button ${currentPage>=totalPages?'disabled':''} onclick="goPage(${totalPages})">&raquo;</button>`;
+  if (total === 0) { container.innerHTML = ''; return; }
   const start = total === 0 ? 0 : (currentPage-1)*pageSize+1;
   const end = Math.min(currentPage*pageSize,total);
+  let html = `<button ${proxyHasPrevious?'':'disabled'} onclick="goCursor('prev')">&lsaquo; 上一页</button>`;
   html += `<span class="page-info">${start}-${end} / ${total}</span>`;
+  html += `<button ${proxyHasNext?'':'disabled'} onclick="goCursor('next')">下一页 &rsaquo;</button>`;
   container.innerHTML = html;
 }
 
-function goPage(page) { currentPage = page; loadProxies(); }
+let proxyCursor = null;
+let proxyCursorDirection = 'next';
+function resetProxyCursor() {
+  currentPage = 1;
+  proxyCursor = null;
+  proxyCursorDirection = 'next';
+}
+function goCursor(direction) {
+  const cursor = direction === 'next' ? proxyNextCursor : proxyPrevCursor;
+  if (!cursor) return;
+  proxyCursor = cursor;
+  proxyCursorDirection = direction;
+  currentPage = Math.max(1, currentPage + (direction === 'next' ? 1 : -1));
+  loadProxies();
+}
 
 function sortBy(field) {
   if (sortField === field) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
   else { sortField = field; sortDir = 'asc'; }
-  loadProxies();
+  resetProxyCursor(); loadProxies();
 }
 
 function queueLoadProxies() {
-  currentPage = 1;
+  resetProxyCursor();
   clearTimeout(proxyFilterTimer);
   proxyFilterTimer = setTimeout(() => loadProxies(), 200);
 }

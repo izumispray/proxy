@@ -12,15 +12,24 @@ pub async fn list_proxies(
     Query(query): Query<ListProxyQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let page = state.db.list_proxy_page(&list_query_to_db(&query))?;
-    let proxy_list: Vec<serde_json::Value> = page.proxies.iter().map(proxy_list_item_to_json).collect();
+    let stale_hours = state.config.quality.stale_hours.max(1);
+    let proxy_list: Vec<serde_json::Value> = page
+        .proxies
+        .iter()
+        .map(|proxy| proxy_list_item_to_json(proxy, stale_hours))
+        .collect();
 
     Ok(Json(json!({
         "proxies": proxy_list,
-        "total": page.total,
-        "filtered": page.filtered,
+        "total": page.counts_available.then_some(page.total),
+        "filtered": page.counts_available.then_some(page.filtered),
         "page": page.page,
         "page_size": page.page_size,
-        "total_pages": page.total_pages,
+        "total_pages": page.counts_available.then_some(page.total_pages),
+        "next_cursor": page.next_cursor,
+        "prev_cursor": page.prev_cursor,
+        "has_next": page.has_next,
+        "has_previous": page.has_previous,
     })))
 }
 
@@ -36,6 +45,7 @@ pub async fn delete_proxy(
     state.binding_usage.remove(&id);
     state.pool.remove(&id);
     state.db.delete_proxy(&id)?;
+    crate::api::fetch::invalidate_stats_cache(state.as_ref());
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     Ok(Json(json!({ "message": "Proxy deleted" })))
 }
@@ -64,6 +74,7 @@ pub async fn cleanup_proxies(
         state.pool.remove(&proxy.id);
     }
     if count > 0 {
+        crate::api::fetch::invalidate_stats_cache(state.as_ref());
         crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     }
 
@@ -118,7 +129,7 @@ pub async fn trigger_quality_check(
 pub async fn get_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let stats = state.db.get_stats()?;
+    let stats = crate::api::fetch::get_cached_stats(state.as_ref())?;
     Ok(Json(stats))
 }
 

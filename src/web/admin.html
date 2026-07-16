@@ -221,13 +221,13 @@ tr:hover td { background:rgba(108,99,255,.03); }
     </div>
     <div class="filter-bar">
       <input id="f-search" placeholder="搜索名称/服务器..." oninput="queueLoadProxies()">
-      <select id="f-status" onchange="currentPage=1;loadProxies()">
+      <select id="f-status" onchange="resetProxyCursor();loadProxies()">
         <option value="">全部状态</option>
         <option value="valid">有效</option>
         <option value="invalid">无效</option>
         <option value="untested">待检测</option>
       </select>
-      <select id="f-type" onchange="currentPage=1;loadProxies()">
+      <select id="f-type" onchange="resetProxyCursor();loadProxies()">
         <option value="">全部类型</option>
         <option value="vmess">VMess</option>
         <option value="vless">VLESS</option>
@@ -235,7 +235,7 @@ tr:hover td { background:rgba(108,99,255,.03); }
         <option value="shadowsocks">Shadowsocks</option>
         <option value="hysteria2">Hysteria2</option>
       </select>
-      <select id="f-quality" onchange="currentPage=1;loadProxies()">
+      <select id="f-quality" onchange="resetProxyCursor();loadProxies()">
         <option value="">全部质量</option>
         <option value="chatgpt">ChatGPT 可用</option>
         <option value="google">Google 可用</option>
@@ -279,7 +279,12 @@ const pageSize = 50;
 let proxyTotal = 0;
 let proxyFiltered = 0;
 let proxyTotalPages = 0;
+let proxyNextCursor = null;
+let proxyPrevCursor = null;
+let proxyHasNext = false;
+let proxyHasPrevious = false;
 let proxyFilterTimer = null;
+let proxyLoadSequence = 0;
 let defaultSubRefreshInterval = 0;
 
 // --- Auth ---
@@ -531,8 +536,8 @@ async function saveDefaultSubRefresh() {
 }
 
 async function loadProxies() {
+  const loadSequence = ++proxyLoadSequence;
   const params = new URLSearchParams({
-    page: String(currentPage),
     page_size: String(pageSize),
     sort: sortField,
     dir: sortDir,
@@ -545,12 +550,21 @@ async function loadProxies() {
   if (status) params.set('status', status);
   if (type_) params.set('type', type_);
   if (quality) params.set('quality', quality);
+  if (proxyCursor) {
+    params.set('cursor', proxyCursor);
+    params.set('direction', proxyCursorDirection);
+  }
   const d = await api('/api/admin/proxies?' + params.toString());
-  if(!d) return;
+  if(!d || loadSequence !== proxyLoadSequence) return;
+  if (!proxyCursor) currentPage = d.page ?? currentPage;
   currentProxies = d.proxies||[];
-  proxyTotal = d.total ?? 0;
-  proxyFiltered = d.filtered ?? proxyTotal;
-  proxyTotalPages = d.total_pages ?? 0;
+  if (d.total != null) proxyTotal = d.total;
+  if (d.filtered != null) proxyFiltered = d.filtered;
+  if (d.total_pages != null) proxyTotalPages = d.total_pages;
+  proxyNextCursor = d.next_cursor || null;
+  proxyPrevCursor = d.prev_cursor || null;
+  proxyHasNext = !!d.has_next;
+  proxyHasPrevious = !!d.has_previous;
   renderProxies();
 }
 
@@ -585,7 +599,7 @@ function renderProxies() {
       <td>${q?(q.chatgpt?yes:no):na}</td>
       <td>${q?(q.google?yes:no):na}</td>
       <td>${q?(q.is_residential?yes:no):na}</td>
-      <td>${q&&q.checked_at?fmtDate(q.checked_at):'-'}</td>
+      <td>${q&&q.checked_at?`${fmtDate(q.checked_at)}${q.stale?' <span class="badge badge-invalid">已过期</span>':''}`:'-'}</td>
       <td><button class="btn btn-danger btn-sm" onclick="deleteProxy('${p.id}')">删除</button></td>
     </tr>`;
   }).join('');
@@ -595,37 +609,39 @@ function renderProxies() {
 
 function renderPagination(total, totalPages) {
   const container = document.getElementById('proxy-pagination');
-  if(totalPages <= 1) { container.innerHTML=''; return; }
-  let html = '';
-  html += `<button ${currentPage<=1?'disabled':''} onclick="goPage(1)">&laquo;</button>`;
-  html += `<button ${currentPage<=1?'disabled':''} onclick="goPage(${currentPage-1})">&lsaquo;</button>`;
-  const maxVisible = 7;
-  let startPage = Math.max(1, currentPage - Math.floor(maxVisible/2));
-  let endPage = Math.min(totalPages, startPage + maxVisible - 1);
-  if(endPage - startPage < maxVisible - 1) startPage = Math.max(1, endPage - maxVisible + 1);
-  if(startPage > 1) html += `<span class="page-info">...</span>`;
-  for(let i = startPage; i <= endPage; i++) {
-    html += `<button class="${i===currentPage?'active':''}" onclick="goPage(${i})">${i}</button>`;
-  }
-  if(endPage < totalPages) html += `<span class="page-info">...</span>`;
-  html += `<button ${currentPage>=totalPages?'disabled':''} onclick="goPage(${currentPage+1})">&rsaquo;</button>`;
-  html += `<button ${currentPage>=totalPages?'disabled':''} onclick="goPage(${totalPages})">&raquo;</button>`;
+  if(total === 0) { container.innerHTML=''; return; }
   const start = total === 0 ? 0 : (currentPage-1)*pageSize+1;
   const end = Math.min(currentPage*pageSize,total);
+  let html = `<button ${proxyHasPrevious?'':'disabled'} onclick="goCursor('prev')">&lsaquo; 上一页</button>`;
   html += `<span class="page-info">${start}-${end} / ${total}</span>`;
+  html += `<button ${proxyHasNext?'':'disabled'} onclick="goCursor('next')">下一页 &rsaquo;</button>`;
   container.innerHTML = html;
 }
 
-function goPage(page) { currentPage = page; loadProxies(); }
+let proxyCursor = null;
+let proxyCursorDirection = 'next';
+function resetProxyCursor() {
+  currentPage = 1;
+  proxyCursor = null;
+  proxyCursorDirection = 'next';
+}
+function goCursor(direction) {
+  const cursor = direction === 'next' ? proxyNextCursor : proxyPrevCursor;
+  if (!cursor) return;
+  proxyCursor = cursor;
+  proxyCursorDirection = direction;
+  currentPage = Math.max(1, currentPage + (direction === 'next' ? 1 : -1));
+  loadProxies();
+}
 
 function sortBy(field) {
   if(sortField===field) sortDir = sortDir==='asc'?'desc':'asc';
   else { sortField=field; sortDir='asc'; }
-  loadProxies();
+  resetProxyCursor(); loadProxies();
 }
 
 function queueLoadProxies() {
-  currentPage = 1;
+  resetProxyCursor();
   clearTimeout(proxyFilterTimer);
   proxyFilterTimer = setTimeout(() => loadProxies(), 200);
 }
@@ -636,6 +652,7 @@ async function deleteProxy(id) {
   if(d && d.error) { toast('删除失败: '+d.error); return; }
   if(!d) return;
   toast('代理已删除');
+  resetProxyCursor();
   refresh();
 }
 
@@ -645,6 +662,7 @@ async function deleteSub(id) {
   if(d && d.error) { toast('删除失败: '+d.error); return; }
   if(!d) return;
   toast('订阅源已删除');
+  resetProxyCursor();
   refresh();
 }
 
@@ -653,6 +671,7 @@ async function refreshSub(id) {
   const d = await api('/api/subscriptions/'+id+'/refresh', {method:'POST'});
   if(d && d.error) { toast('刷新失败: ' + d.error); return; }
   if(d) toast('刷新完成: 新增 '+d.proxies_added+' 个代理');
+  resetProxyCursor();
   refresh();
 }
 
@@ -678,6 +697,7 @@ async function cleanupProxies() {
   if(!confirm('确定清理所有超过错误阈值的代理？')) return;
   const d = await api('/api/admin/proxies/cleanup', {method:'POST'});
   if(d) toast(d.message);
+  resetProxyCursor();
   refresh();
 }
 
@@ -691,6 +711,7 @@ async function cleanupUselessProxies() {
     if(d && !d.error) deleted++;
   }
   toast('已删除 ' + deleted + ' 个三不通代理');
+  resetProxyCursor();
   refresh();
 }
 

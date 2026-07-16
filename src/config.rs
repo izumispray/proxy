@@ -90,6 +90,9 @@ pub struct DatabaseConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValidationConfig {
     pub url: String,
+    /// Optional second probe used when the primary probe cannot be reached.
+    #[serde(default)]
+    pub fallback_url: Option<String>,
     pub timeout_secs: u64,
     pub concurrency: usize,
     pub interval_mins: u64,
@@ -102,6 +105,21 @@ pub struct ValidationConfig {
     /// The rest stay with Valid proxies serving users. Default 30.
     #[serde(default = "default_validation_batch")]
     pub batch_size: usize,
+    /// Re-check previously valid proxies after this many hours. Set 0 to disable.
+    #[serde(default = "default_valid_recheck_hours")]
+    pub valid_recheck_hours: u64,
+    /// Share of each scheduling batch reserved for never-tested proxies.
+    #[serde(default = "default_new_proxy_percent")]
+    pub new_proxy_percent: u8,
+    /// Share reserved for periodically rechecking valid proxies.
+    #[serde(default = "default_valid_recheck_percent")]
+    pub valid_recheck_percent: u8,
+    /// Share reserved for cooled-down invalid proxies.
+    #[serde(default = "default_invalid_retry_percent")]
+    pub invalid_retry_percent: u8,
+    /// Consecutive binding failures tolerated before a proxy is removed.
+    #[serde(default = "default_binding_failure_threshold")]
+    pub binding_failure_threshold: u32,
 }
 
 fn default_validation_max_rounds() -> usize {
@@ -116,10 +134,44 @@ fn default_validation_batch() -> usize {
     30
 }
 
+fn default_valid_recheck_hours() -> u64 {
+    24
+}
+
+fn default_new_proxy_percent() -> u8 {
+    70
+}
+
+fn default_valid_recheck_percent() -> u8 {
+    20
+}
+
+fn default_invalid_retry_percent() -> u8 {
+    10
+}
+
+fn default_binding_failure_threshold() -> u32 {
+    3
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct QualityConfig {
     pub interval_mins: u64,
     pub concurrency: usize,
+    /// Re-check capability and exit-IP metadata after this many hours.
+    #[serde(default = "default_quality_stale_hours")]
+    pub stale_hours: u64,
+    /// Maximum number of proxies checked in one catch-up batch.
+    #[serde(default = "default_quality_max_checks_per_run")]
+    pub max_checks_per_run: usize,
+}
+
+fn default_quality_stale_hours() -> u64 {
+    24
+}
+
+fn default_quality_max_checks_per_run() -> usize {
+    200
 }
 
 #[derive(Debug, Clone, Deserialize)]

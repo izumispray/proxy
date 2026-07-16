@@ -5,9 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-const VALID_ERROR_RECHECK_THRESHOLD: u32 = 1;
-const INVALID_RETRY_COOLDOWN_MINS: i64 = 180;
-
 struct RunningGuard<'a> {
     flag: &'a AtomicBool,
 }
@@ -42,20 +39,6 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
         return Ok(());
     }
 
-    // Reset Valid proxies with error_count > 0 back to Untested so they get re-validated.
-    // This catches proxies that users reported as failing via relay.
-    let recheck = state
-        .db
-        .get_valid_with_errors_ids(VALID_ERROR_RECHECK_THRESHOLD)
-        .unwrap_or_default();
-    if !recheck.is_empty() {
-        tracing::info!("Re-validating {} proxies with relay errors", recheck.len());
-        for id in &recheck {
-            state.pool.set_status(id, ProxyStatus::Untested);
-            state.db.reset_proxy_to_untested(id).ok();
-        }
-    }
-
     let orphaned_cutoff = (chrono::Utc::now()
         - chrono::Duration::hours(state.config.subscription.orphaned_valid_grace_hours as i64))
     .to_rfc3339();
@@ -69,51 +52,10 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
         _ => {}
     }
 
-    let untested_before_retry = state.db.count_untested_proxies().unwrap_or(0);
-    if untested_before_retry == 0 {
-        let retry_limit = state.config.validation.retry_invalid_per_run;
-        let orphaned_ids = state
-            .db
-            .get_orphaned_valid_recheck_ids(&orphaned_cutoff, retry_limit)
-            .unwrap_or_default();
-
-        if !orphaned_ids.is_empty() {
-            tracing::info!(
-                "Re-validating {} orphaned valid proxies (grace={}h)",
-                orphaned_ids.len(),
-                state.config.subscription.orphaned_valid_grace_hours
-            );
-            for id in &orphaned_ids {
-                state.pool.set_status(id, ProxyStatus::Untested);
-                state.db.reset_proxy_to_untested(id).ok();
-            }
-        } else {
-            let error_threshold = state.config.validation.error_threshold;
-            let retry_before =
-                (chrono::Utc::now() - chrono::Duration::minutes(INVALID_RETRY_COOLDOWN_MINS))
-                    .to_rfc3339();
-            let retry_ids = state
-                .db
-                .get_invalid_retry_ids(error_threshold, &retry_before, retry_limit)
-                .unwrap_or_default();
-
-            if !retry_ids.is_empty() {
-                tracing::info!(
-                    "Retrying {} previously invalid proxies (threshold={error_threshold}, cooldown={}m)",
-                    retry_ids.len(),
-                    INVALID_RETRY_COOLDOWN_MINS
-                );
-                for id in &retry_ids {
-                    state.pool.set_status(id, ProxyStatus::Untested);
-                    state.db.reset_proxy_to_untested(id).ok();
-                }
-            }
-        }
-    }
-
     let concurrency = state.config.validation.concurrency;
     let timeout_duration = std::time::Duration::from_secs(state.config.validation.timeout_secs);
     let validation_url = state.config.validation.url.clone();
+    let fallback_url = state.config.validation.fallback_url.clone();
     let max_proxies = state.config.singbox.max_proxies;
     let max_rounds = state.config.validation.max_rounds_per_run;
 
@@ -127,14 +69,13 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
         let sync_result =
             crate::api::subscription::sync_proxy_bindings(&state, SyncMode::Validation).await;
 
-        let selected_untested: Vec<_> = sync_result
-            .selected_ids
+        let selected_work: Vec<_> = sync_result
+            .work_ids
             .iter()
             .filter_map(|id| state.pool.get(id))
-            .filter(|p| p.status == ProxyStatus::Untested)
             .collect();
 
-        let failed_to_bind: Vec<_> = selected_untested
+        let failed_to_bind: Vec<_> = selected_work
             .iter()
             .filter(|p| p.local_port.is_none())
             .cloned()
@@ -145,16 +86,15 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
         }
 
         // Collect only the untested proxies selected for this round that actually got bindings.
-        let to_validate: Vec<_> = selected_untested
+        let to_validate: Vec<_> = selected_work
             .iter()
             .filter(|p| p.local_port.is_some())
             .cloned()
             .collect();
-
         if to_validate.is_empty() {
             let remaining_untested = state.db.count_untested_proxies().unwrap_or(0);
 
-            if selected_untested.is_empty() {
+            if selected_work.is_empty() {
                 if remaining_untested > 0 {
                     tracing::warn!(
                         "Validation stopped early: no untested proxies received bindings in round {round}, {} untested remain",
@@ -176,6 +116,7 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
         let round_count = validate_batch(
             &to_validate,
             &validation_url,
+            fallback_url.as_deref(),
             timeout_duration,
             concurrency,
             &state,
@@ -184,21 +125,10 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
 
         total_validated += round_count;
 
-        let valid = state.db.count_valid_proxies().unwrap_or(0);
-        let total = state.db.count_all_proxies().unwrap_or(0);
-        let untested_remaining = state.db.count_untested_proxies().unwrap_or(0);
+        tracing::info!("Round {round}: {round_count} proxies checked");
 
-        tracing::info!(
-            "Round {round}: {round_count} checked, {valid}/{total} valid, {untested_remaining} untested remaining"
-        );
-
-        if untested_remaining == 0 {
-            break;
-        }
         if round as usize >= max_rounds {
-            tracing::info!(
-                "Validation paused after {round} rounds (limit={max_rounds}), {untested_remaining} untested remain"
-            );
+            tracing::info!("Validation paused after {round} rounds (limit={max_rounds})");
             break;
         }
     }
@@ -228,6 +158,7 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
     // Final assignment: normal mode (Valid gets priority for serving traffic)
     let _ = crate::api::subscription::sync_proxy_bindings(&state, SyncMode::Normal).await;
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
+    crate::api::fetch::invalidate_stats_cache(state.as_ref());
 
     let valid = state.db.count_valid_proxies().unwrap_or(0);
     let total = state.db.count_all_proxies().unwrap_or(0);
@@ -242,9 +173,24 @@ async fn drop_proxy_after_binding_failure(
     state: &Arc<AppState>,
     proxy: &crate::pool::manager::PoolProxy,
 ) {
+    let failures = match state.db.record_proxy_binding_failure(&proxy.id) {
+        Ok(failures) => failures,
+        Err(error) => {
+            tracing::warn!("Failed to record binding failure for {}: {error}", proxy.name);
+            return;
+        }
+    };
+    let threshold = state.config.validation.binding_failure_threshold.max(1);
+    if failures < threshold {
+        tracing::warn!(
+            "Proxy {} failed to get binding ({failures}/{threshold}); keeping it for a later round",
+            proxy.name
+        );
+        return;
+    }
     tracing::warn!(
-        "Proxy {} failed to get binding, deleting immediately",
-        proxy.name
+        "Proxy {} failed to get binding {failures} consecutive times; removing it",
+        proxy.name,
     );
     crate::bindings::cleanup_proxy_binding(state, &proxy.id, proxy.local_port).await;
     state.binding_usage.remove(&proxy.id);
@@ -256,6 +202,7 @@ async fn drop_proxy_after_binding_failure(
 async fn validate_batch(
     proxies: &[crate::pool::manager::PoolProxy],
     validation_url: &str,
+    fallback_url: Option<&str>,
     timeout: std::time::Duration,
     concurrency: usize,
     state: &Arc<AppState>,
@@ -272,6 +219,7 @@ async fn validate_batch(
         let sem = semaphore.clone();
         let state = state.clone();
         let url = validation_url.to_string();
+        let fallback_url = fallback_url.map(str::to_string);
         let proxy_id = proxy.id.clone();
         let proxy_name = proxy.name.clone();
 
@@ -279,7 +227,8 @@ async fn validate_batch(
             let _permit = sem.acquire().await.unwrap();
 
             let proxy_addr = format!("http://127.0.0.1:{local_port}");
-            let result = validate_single(&proxy_addr, &url, timeout).await;
+            let result =
+                validate_with_fallback(&proxy_addr, &url, fallback_url.as_deref(), timeout).await;
 
             match result {
                 Ok(()) => {
@@ -327,7 +276,6 @@ async fn validate_single(
         .no_proxy()
         .proxy(proxy)
         .timeout(timeout)
-        .danger_accept_invalid_certs(true)
         .pool_max_idle_per_host(0) // don't keep idle connections
         .build()
         .map_err(|e| format!("Client build error: {e}"))?;
@@ -338,9 +286,54 @@ async fn validate_single(
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
 
-    if resp.status().is_success() || resp.status().is_redirection() {
+    if resp.status() == reqwest::StatusCode::NO_CONTENT {
         Ok(())
     } else {
-        Err(format!("HTTP {}", resp.status()))
+        Err(format!("Expected HTTP 204, got {}", resp.status()))
+    }
+}
+
+async fn validate_with_fallback(
+    proxy_addr: &str,
+    primary_url: &str,
+    fallback_url: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let primary = validate_single(proxy_addr, primary_url, timeout).await;
+    match (
+        primary,
+        fallback_url.filter(|url| !url.is_empty() && *url != primary_url),
+    ) {
+        (Ok(()), _) => Ok(()),
+        (Err(primary_error), Some(fallback)) => {
+            validate_single(proxy_addr, fallback, timeout)
+                .await
+                .map_err(|fallback_error| {
+                    format!(
+                        "primary probe failed ({primary_error}); fallback failed ({fallback_error})"
+                    )
+                })
+        }
+        (Err(error), None) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::subscription::validation_batch_limits;
+
+    #[test]
+    fn expected_status_is_exact() {
+        assert_eq!(reqwest::StatusCode::NO_CONTENT.as_u16(), 204);
+        assert_ne!(reqwest::StatusCode::OK.as_u16(), 204);
+    }
+
+    #[test]
+    fn validation_batch_has_non_starving_default_quotas() {
+        assert_eq!(
+            validation_batch_limits(300, 70, 20, 10, true),
+            (210, 60, 30)
+        );
+        assert_eq!(validation_batch_limits(3, 70, 20, 10, true), (1, 1, 1));
     }
 }

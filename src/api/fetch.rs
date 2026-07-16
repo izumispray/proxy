@@ -83,16 +83,25 @@ pub async fn list_all_proxies(
     auth::authenticate_request(&state, &headers, query.api_key.as_deref()).await?;
 
     let page = state.db.list_proxy_page(&list_query_to_db(&query))?;
-    let stats = state.db.get_stats()?;
-    let proxy_list: Vec<serde_json::Value> = page.proxies.iter().map(proxy_list_item_to_json).collect();
+    let stats = get_cached_stats(state.as_ref())?;
+    let stale_hours = state.config.quality.stale_hours.max(1);
+    let proxy_list: Vec<serde_json::Value> = page
+        .proxies
+        .iter()
+        .map(|proxy| proxy_list_item_to_json(proxy, stale_hours))
+        .collect();
 
     Ok(Json(json!({
         "proxies": proxy_list,
-        "total": page.total,
-        "filtered": page.filtered,
+        "total": page.counts_available.then_some(page.total),
+        "filtered": page.counts_available.then_some(page.filtered),
         "page": page.page,
         "page_size": page.page_size,
-        "total_pages": page.total_pages,
+        "total_pages": page.counts_available.then_some(page.total_pages),
+        "next_cursor": page.next_cursor,
+        "prev_cursor": page.prev_cursor,
+        "has_next": page.has_next,
+        "has_previous": page.has_previous,
         "valid": stats["valid_proxies"],
         "untested": stats["untested_proxies"],
         "invalid": stats["invalid_proxies"],
@@ -108,6 +117,8 @@ pub struct ListProxyQuery {
     pub api_key: Option<String>,
     pub page: Option<usize>,
     pub page_size: Option<usize>,
+    pub cursor: Option<String>,
+    pub direction: Option<String>,
     pub search: Option<String>,
     pub status: Option<String>,
     #[serde(rename = "type")]
@@ -141,7 +152,11 @@ fn proxy_to_json(p: &crate::pool::manager::PoolProxy) -> serde_json::Value {
     })
 }
 
-pub fn proxy_list_item_to_json(p: &crate::db::ProxyListItem) -> serde_json::Value {
+pub fn proxy_list_item_to_json(
+    p: &crate::db::ProxyListItem,
+    stale_hours: u64,
+) -> serde_json::Value {
+    let now = chrono::Utc::now();
     json!({
         "id": p.id,
         "subscription_id": p.subscription_id,
@@ -162,6 +177,11 @@ pub fn proxy_list_item_to_json(p: &crate::db::ProxyListItem) -> serde_json::Valu
             "risk_score": q.risk_score,
             "risk_level": q.risk_level,
             "checked_at": q.checked_at,
+            "stale": crate::quality::checker::quality_checked_at_is_stale(
+                Some(q.checked_at.as_str()),
+                &now,
+                stale_hours,
+            ),
         })),
     })
 }
@@ -170,6 +190,8 @@ pub fn list_query_to_db(query: &ListProxyQuery) -> ProxyListQuery {
     ProxyListQuery {
         page: query.page.unwrap_or(1),
         page_size: query.page_size.unwrap_or(50),
+        cursor: query.cursor.clone(),
+        direction: query.direction.clone(),
         search: query.search.clone(),
         status: query.status.clone(),
         proxy_type: query.proxy_type.clone(),
@@ -177,6 +199,28 @@ pub fn list_query_to_db(query: &ListProxyQuery) -> ProxyListQuery {
         sort: query.sort.clone(),
         dir: query.dir.clone(),
     }
+}
+
+pub fn get_cached_stats(state: &AppState) -> Result<serde_json::Value, AppError> {
+    if let Some(entry) = state.dashboard_stats_cache.get(&()) {
+        if entry.expires_at > tokio::time::Instant::now() {
+            return Ok(entry.value.clone());
+        }
+    }
+
+    let value = state.db.get_stats()?;
+    state.dashboard_stats_cache.insert(
+        (),
+        crate::DashboardStatsCacheEntry {
+            value: value.clone(),
+            expires_at: tokio::time::Instant::now() + std::time::Duration::from_secs(15),
+        },
+    );
+    Ok(value)
+}
+
+pub fn invalidate_stats_cache(state: &AppState) {
+    state.dashboard_stats_cache.clear();
 }
 
 pub fn find_proxy_snapshot(

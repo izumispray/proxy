@@ -42,6 +42,9 @@ pub enum SyncMode {
 
 pub struct SyncBindingsResult {
     pub selected_ids: Vec<String>,
+    /// IDs selected specifically for the requested maintenance job. This
+    /// excludes ordinary prebound serving proxies.
+    pub work_ids: Vec<String>,
 }
 
 pub async fn list_subscriptions(
@@ -152,6 +155,7 @@ pub async fn add_subscription(
 
     state.db.insert_proxies_batch(&proxy_rows)?;
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
+    crate::api::fetch::invalidate_stats_cache(state.as_ref());
 
     let added = proxy_rows.len();
 
@@ -194,6 +198,7 @@ pub async fn delete_subscription(
     state.pool.remove_by_subscription(&id);
     state.db.delete_subscription(&id)?;
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
+    crate::api::fetch::invalidate_stats_cache(state.as_ref());
 
     // Sync bindings in background
     let state2 = state.clone();
@@ -312,16 +317,38 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
         let key = (pc.server.clone(), pc.port, pc.proxy_type.to_string());
 
         if let Some(old) = old_map.remove(&key) {
-            // Same proxy still exists — update config but preserve status
+            // Same endpoint still exists. Preserve health only when the full
+            // outbound is unchanged; credentials/transport changes require a
+            // fresh validation and fresh quality metadata.
             kept_ids.insert(old.id.clone());
 
-            // Update the outbound config in DB (it may have changed)
             let new_config = serde_json::to_string(&pc.singbox_outbound).unwrap_or_default();
-            state.db.update_proxy_config(&old.id, &pc.name, &new_config)
-                .map_err(|e| format!("Failed to update proxy config: {e}"))?;
-
-            // Update pool entry's name and outbound (keep status, local_port, etc.)
-            state.pool.update_proxy_config(&old.id, &pc.name, pc.singbox_outbound.clone());
+            let old_value = serde_json::from_str::<serde_json::Value>(&old.config_json).ok();
+            let config_changed = old_value.as_ref() != Some(&pc.singbox_outbound);
+            if config_changed {
+                crate::bindings::cleanup_proxy_binding(
+                    state,
+                    &old.id,
+                    old.local_port.map(|port| port as u16),
+                )
+                .await;
+                state.binding_usage.remove(&old.id);
+                state.pool.remove(&old.id);
+                state
+                    .db
+                    .reset_proxy_after_config_change(&old.id, &pc.name, &new_config)
+                    .map_err(|e| format!("Failed to reset changed proxy config: {e}"))?;
+            } else {
+                state
+                    .db
+                    .update_proxy_config(&old.id, &pc.name, &new_config)
+                    .map_err(|e| format!("Failed to update proxy config: {e}"))?;
+                state.pool.update_proxy_config(
+                    &old.id,
+                    &pc.name,
+                    pc.singbox_outbound.clone(),
+                );
+            }
 
             total += 1;
         } else {
@@ -386,6 +413,7 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
         .mark_subscription_refreshed(&sub.id, total as i32)
         .map_err(|e| format!("Failed to update proxy count: {e}"))?;
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
+    crate::api::fetch::invalidate_stats_cache(state.as_ref());
 
     if removed_invalid > 0 || orphaned_valid > 0 || orphaned_untested > 0 {
         tracing::info!(
@@ -454,6 +482,7 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
 
     let mut selected = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
+    let mut work_ids = Vec::new();
 
     for (row, quality) in state.db.get_hot_proxy_records(prebound).unwrap_or_default() {
         if seen_ids.insert(row.id.clone()) {
@@ -461,16 +490,48 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
         }
     }
     if matches!(mode, SyncMode::Validation) {
-        for (row, quality) in state.db.get_untested_proxy_records(batch).unwrap_or_default() {
+        let cfg = &state.config.validation;
+        let (new_limit, valid_limit, invalid_limit) = validation_batch_limits(
+            batch,
+            cfg.new_proxy_percent,
+            cfg.valid_recheck_percent,
+            cfg.invalid_retry_percent,
+            cfg.valid_recheck_hours > 0,
+        );
+        let now = chrono::Utc::now();
+        let valid_before = (now
+            - chrono::Duration::hours(cfg.valid_recheck_hours.max(1) as i64))
+        .to_rfc3339();
+        let retry_before = (now - chrono::Duration::minutes(180)).to_rfc3339();
+        let orphaned_before = (now
+            - chrono::Duration::hours(
+                state.config.subscription.orphaned_valid_grace_hours as i64,
+            ))
+        .to_rfc3339();
+        for (row, quality) in state
+            .db
+            .get_validation_proxy_records(
+                new_limit,
+                valid_limit,
+                invalid_limit.min(cfg.retry_invalid_per_run),
+                &valid_before,
+                &retry_before,
+                &orphaned_before,
+                cfg.error_threshold,
+            )
+            .unwrap_or_default()
+        {
+            work_ids.push(row.id.clone());
             if seen_ids.insert(row.id.clone()) {
                 selected.push(crate::pool::manager::ProxyPool::from_db_parts(row, quality));
             }
         }
     }
+    let quality_stale_hours = state.config.quality.stale_hours.max(1);
     if matches!(mode, SyncMode::QualityCheck) {
-        let stale_before =
-            (chrono::Utc::now() - chrono::Duration::hours(crate::quality::checker::STALE_HOURS))
-                .to_rfc3339();
+        let stale_before = (chrono::Utc::now()
+            - chrono::Duration::hours(quality_stale_hours as i64))
+        .to_rfc3339();
         for (row, quality) in state
             .db
             .get_due_quality_proxy_records(
@@ -493,8 +554,8 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
     }
     match mode {
         SyncMode::Validation => {
-            for proxy in selected.iter().filter(|p| p.status == ProxyStatus::Untested) {
-                managed_ids.insert(proxy.id.clone());
+            for id in &work_ids {
+                managed_ids.insert(id.clone());
             }
         }
         SyncMode::QualityCheck => {
@@ -503,7 +564,7 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
                 if extra >= batch {
                     break;
                 }
-                if crate::quality::checker::needs_quality_check(proxy, &now) {
+                if crate::quality::checker::needs_quality_check(proxy, &now, quality_stale_hours) {
                     if managed_ids.insert(proxy.id.clone()) {
                         extra += 1;
                     }
@@ -574,6 +635,7 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
     for (id, port) in &assignments {
         state.pool.set_local_port(id, *port);
         state.db.update_proxy_local_port(id, *port as i32).ok();
+        state.db.clear_proxy_binding_failures(id).ok();
     }
     let assigned_ids: std::collections::HashSet<&str> =
         assignments.iter().map(|(id, _)| id.as_str()).collect();
@@ -590,7 +652,52 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
 
     SyncBindingsResult {
         selected_ids,
+        work_ids,
     }
+}
+
+pub(crate) fn validation_batch_limits(
+    batch: usize,
+    new_percent: u8,
+    valid_percent: u8,
+    invalid_percent: u8,
+    valid_enabled: bool,
+) -> (usize, usize, usize) {
+    if batch == 0 {
+        return (0, 0, 0);
+    }
+    let new_percent = new_percent as usize;
+    let valid_percent = if valid_enabled { valid_percent as usize } else { 0 };
+    let invalid_percent = invalid_percent as usize;
+    let total = new_percent + valid_percent + invalid_percent;
+    if total == 0 {
+        return (batch, 0, 0);
+    }
+
+    let mut new_limit = batch * new_percent / total;
+    let mut valid_limit = batch * valid_percent / total;
+    let mut invalid_limit = batch * invalid_percent / total;
+    if new_percent > 0 {
+        new_limit = new_limit.max(1);
+    }
+    if valid_percent > 0 {
+        valid_limit = valid_limit.max(1);
+    }
+    if invalid_percent > 0 {
+        invalid_limit = invalid_limit.max(1);
+    }
+
+    while new_limit + valid_limit + invalid_limit > batch {
+        if new_limit >= valid_limit && new_limit >= invalid_limit && new_limit > 0 {
+            new_limit -= 1;
+        } else if valid_limit >= invalid_limit && valid_limit > 0 {
+            valid_limit -= 1;
+        } else if invalid_limit > 0 {
+            invalid_limit -= 1;
+        }
+    }
+    new_limit += batch - (new_limit + valid_limit + invalid_limit);
+    (new_limit, valid_limit, invalid_limit)
 }
 
 fn validate_refresh_interval_mins(value: Option<i32>) -> Result<Option<i32>, AppError> {

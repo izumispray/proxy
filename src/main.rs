@@ -29,6 +29,8 @@ pub struct AppState {
     pub relay_clients: DashMap<u16, reqwest::Client>,
     /// Cached generated client subscription bodies keyed by selector/format.
     pub subscription_export_cache: DashMap<String, SubscriptionExportCacheEntry>,
+    /// Short-lived aggregate dashboard cache; avoids repeated full-table scans.
+    pub dashboard_stats_cache: DashMap<(), DashboardStatsCacheEntry>,
     /// Auth cache: (api_key | session_id) → (User, expires_at_instant).
     pub auth_cache: DashMap<String, (User, tokio::time::Instant)>,
     /// Serializes binding changes during validation/quality work.
@@ -43,6 +45,12 @@ pub struct AppState {
 pub struct SubscriptionExportCacheEntry {
     pub body: String,
     pub proxy_count: usize,
+    pub expires_at: tokio::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct DashboardStatsCacheEntry {
+    pub value: serde_json::Value,
     pub expires_at: tokio::time::Instant,
 }
 
@@ -119,6 +127,7 @@ async fn main() {
         binding_usage: DashMap::new(),
         relay_clients: DashMap::new(),
         subscription_export_cache: DashMap::new(),
+        dashboard_stats_cache: DashMap::new(),
         auth_cache: DashMap::new(),
         validation_lock: Mutex::new(()),
         validation_running: AtomicBool::new(false),
@@ -173,19 +182,24 @@ async fn start_background_tasks(state: Arc<AppState>) {
     let state_clone = state.clone();
     // Quality check — only checks proxies without quality data or with stale data
     tokio::spawn(async move {
+        if state_clone.config.quality.interval_mins == 0 {
+            tracing::info!("Automatic quality checks are disabled (quality.interval_mins=0)");
+            return;
+        }
         // Wait a bit on startup for proxies to be validated first
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let idle_interval = std::time::Duration::from_secs(
+            state_clone
+                .config
+                .quality
+                .interval_mins
+                .saturating_mul(60),
+        );
         loop {
-            let checked = match quality::checker::check_all(state_clone.clone()).await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!("Quality check error: {e}");
-                    0
-                }
-            };
-            // If nothing needed checking, wait longer before next round
-            let pause = if checked == 0 { 300 } else { 30 };
-            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
+            if let Err(e) = quality::checker::check_all(state_clone.clone()).await {
+                tracing::error!("Quality check error: {e}");
+            }
+            tokio::time::sleep(idle_interval).await;
         }
     });
 

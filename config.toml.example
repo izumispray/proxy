@@ -24,25 +24,36 @@ memory_restart_mb = 3072
 url = "postgresql://postgres:change-me@127.0.0.1:5432/zenproxy"
 
 [validation]
-url = "https://www.bing.com"
+url = "https://www.gstatic.com/generate_204"
+fallback_url = "https://cp.cloudflare.com/generate_204"
 timeout_secs = 10
 concurrency = 200
-interval_mins = 5
+interval_mins = 30
 error_threshold = 10
-max_rounds_per_run = 200
+max_rounds_per_run = 20
 retry_invalid_per_run = 500
 batch_size = 300
+valid_recheck_hours = 24
+new_proxy_percent = 70
+valid_recheck_percent = 20
+invalid_retry_percent = 10
+binding_failure_threshold = 3
 
 [quality]
-interval_mins = 120
+interval_mins = 180
 concurrency = 10
+stale_hours = 72
+max_checks_per_run = 200
 
 [relay]
 timeout_secs = 600
 
 [subscription]
 password = "change-subscription-password"
-auto_refresh_interval_mins = 0
+# URL subscriptions refresh automatically once a day. Set 0 only when you
+# intentionally want to disable unattended refresh. Per-subscription settings
+# may override this global default.
+auto_refresh_interval_mins = 1440
 orphaned_valid_grace_hours = 24
 export_cache_secs = 60
 

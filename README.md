@@ -91,25 +91,33 @@ binding_idle_secs = 300
 url = "postgresql://postgres:change-me@127.0.0.1:5432/zenproxy"
 
 [validation]
-url = "https://www.bing.com"
+url = "https://www.gstatic.com/generate_204"
+fallback_url = "https://cp.cloudflare.com/generate_204"
 timeout_secs = 10
 concurrency = 200
-interval_mins = 5
+interval_mins = 30
 error_threshold = 10
-max_rounds_per_run = 200
+max_rounds_per_run = 20
 retry_invalid_per_run = 500
 batch_size = 300
+valid_recheck_hours = 24
+new_proxy_percent = 70
+valid_recheck_percent = 20
+invalid_retry_percent = 10
+binding_failure_threshold = 3
 
 [quality]
-interval_mins = 120
+interval_mins = 180
 concurrency = 10
+stale_hours = 72
+max_checks_per_run = 200
 
 [relay]
 timeout_secs = 600
 
 [subscription]
 password = "change-subscription-password" # 订阅下载密码（请与管理密码不同）
-auto_refresh_interval_mins = 0
+auto_refresh_interval_mins = 1440          # URL 订阅每天无人值守自动刷新
 orphaned_valid_grace_hours = 24
 export_cache_secs = 60
 
@@ -403,9 +411,11 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 
 ### 验证与质检
 
+`[quality] interval_mins` 控制后台质检轮询周期（设为 `0` 关闭自动质检），`stale_hours` 控制旧质检结果多久后标记为过期并重新检查，`max_checks_per_run` 限制每轮数量。管理面板的手动质检仍会立即触发。
+
 #### 代理验证（Validation）
 
-验证通过配置的 URL 检测代理是否可用，标记为 Valid / Invalid。
+验证通过配置的主、备用 URL 检测代理是否可用；两个地址都只接受精确的 HTTP 204，并正常校验 TLS 证书。主地址失败后才尝试备用地址。
 
 **触发时机：**
 - 导入/刷新订阅后**立即触发**
@@ -413,24 +423,25 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 - 定时订阅刷新后自动触发（需开启 `auto_refresh_interval_mins`）
 
 **流程：**
-1. 检查 Valid 代理中 `error_count > 0` 的（用户使用时失败过），重置为 Untested 重新验证
-2. `sync_proxy_bindings(Validation)` — 优先为 Untested 代理分配端口
-3. 并发验证所有有端口的 Untested 代理
+1. 每轮按 `new_proxy_percent` / `valid_recheck_percent` / `invalid_retry_percent` 分配新节点、到期有效节点、冷却后的无效节点名额，避免任一队列长期饿死
+2. 有效节点超过 `valid_recheck_hours` 后重新验证；设为 `0` 可关闭这类周期复验
+3. `sync_proxy_bindings(Validation)` 为本轮候选分配临时端口并并发探测
 4. 成功 → Valid（error_count 清零），失败 → Invalid
-5. 如果 Untested 数量 > `max_proxies`，多轮循环直到全部验证完
-6. 无法获取绑定的代理（配置错误）直接标记为 Invalid
+5. sing-box 绑定失败独立计数且有冷却，不会立即删除；达到 `binding_failure_threshold` 才淘汰
+6. 达到 `max_rounds_per_run` 后暂停，下一次定时任务继续处理
 7. 验证完成后执行 `sync_proxy_bindings(Normal)` 恢复正常端口分配
 
-**Relay 失败反馈：** 用户通过 `/api/relay` 使用代理失败时，该代理的 `error_count` 会自动增加。下次定时验证时，这些有错误的代理会被重新验证，不通过则标记为 Invalid 移除。
+**Relay 失败反馈：** 用户通过 `/api/relay` 使用代理失败时，该代理的 `error_count` 会自动增加并进入待重试状态。为避免短时网络抖动反复占用端口，失败节点冷却 3 小时后才会进入无效节点复验队列。
 
 #### 订阅自动刷新
 
-在 `config.toml` 中设置 `[subscription] auto_refresh_interval_mins`（非 0 值）即可启用定时自动刷新。
+在 `config.toml` 中设置 `[subscription] auto_refresh_interval_mins = 1440` 即可每天无人值守刷新；设为 `0` 才会关闭。单个订阅设置了独立刷新周期时，以单个订阅为准。URL 订阅刷新完成后会自动进入验活，不需要点击后台按钮。
 
 **刷新策略（平滑替换）：**
 - 拉取/解析失败时，旧代理**完全不受影响**
 - 解析出 0 个代理时，中止刷新，保留旧数据
-- 对 (server, port, proxy_type) 相同的代理，**保留**其验证状态、端口绑定和质检数据
+- 对 (server, port, proxy_type) 及完整 outbound 配置都相同的代理，保留验证状态、端口绑定和质检数据
+- 如果端点相同但密码、UUID、传输或 TLS 等 outbound 配置变化，清理旧绑定/质检并重新验活
 - 仅新增的代理标记为 Untested 等待验证
 - 仅已消失的旧代理才会被删除
 - 全部刷新完成后统一触发一次验证

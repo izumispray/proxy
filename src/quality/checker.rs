@@ -6,12 +6,8 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::Instant;
 
-/// Staleness threshold: re-check quality after 24 hours.
-pub(crate) const STALE_HOURS: i64 = 24;
 /// Incomplete quality data can be retried at most this many times.
 pub(crate) const MAX_INCOMPLETE_RETRIES: u8 = 2;
-/// Limit checks per run so quality task won't hold validation resources for too long.
-const MAX_QUALITY_CHECKS_PER_RUN: usize = 40;
 
 /// ip-api.com rate limiter: max 40 requests/minute (free tier limit is 45).
 struct RateLimiter {
@@ -66,15 +62,18 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
     let now = chrono::Utc::now();
     let mut total_checked = 0usize;
     let rate_limiter = Arc::new(RateLimiter::new(40));
+    let stale_hours = state.config.quality.stale_hours.max(1);
+    let max_checks = state.config.quality.max_checks_per_run.max(1);
 
     // Hold lock only for short binding-selection work.
     let to_check = {
         let _lock = state.validation_lock.lock().await;
-        let stale_before = (now - chrono::Duration::hours(STALE_HOURS)).to_rfc3339();
+        let stale_before =
+            (now - chrono::Duration::hours(stale_hours as i64)).to_rfc3339();
         let due = state
             .db
             .get_due_quality_proxy_records(
-                MAX_QUALITY_CHECKS_PER_RUN,
+                max_checks,
                 &stale_before,
                 MAX_INCOMPLETE_RETRIES,
             )
@@ -96,15 +95,16 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
             .filter_map(|id| state.pool.get(id))
             .filter(|p| p.status == crate::pool::manager::ProxyStatus::Valid)
             .filter(|p| p.local_port.is_some())
-            .filter(|p| needs_quality_check(p, &now))
-            .take(MAX_QUALITY_CHECKS_PER_RUN)
+            .filter(|p| needs_quality_check(p, &now, stale_hours))
+            .take(max_checks)
             .collect::<Vec<PoolProxy>>()
     };
 
     if !to_check.is_empty() {
         tracing::info!(
-            "Quality check: checking {} proxies this run (limit={MAX_QUALITY_CHECKS_PER_RUN})",
-            to_check.len()
+            "Quality check: checking {} proxies this run (limit={max_checks}, stale_after={}h)",
+            to_check.len(),
+            stale_hours,
         );
         total_checked += check_batch(&to_check, &state, &rate_limiter).await;
     } else {
@@ -119,6 +119,7 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
     .await;
 
     if total_checked > 0 {
+        crate::api::fetch::invalidate_stats_cache(state.as_ref());
         tracing::info!("Quality check complete: {total_checked} proxies checked in this run");
     }
 
@@ -144,7 +145,7 @@ async fn check_batch(
 
             let local_port = match proxy.local_port {
                 Some(p) => p,
-                None => return,
+                None => return false,
             };
 
             let proxy_addr = format!("http://127.0.0.1:{local_port}");
@@ -197,12 +198,17 @@ async fn check_batch(
                         extra_json: Some(extra.to_string()),
                         checked_at: chrono::Utc::now().to_rfc3339(),
                     };
-                    state.db.upsert_quality(&db_quality).ok();
+                    if let Err(error) = state.db.upsert_quality(&db_quality) {
+                        tracing::warn!("Failed to save quality for {}: {error}", proxy.name);
+                        return false;
+                    }
                     quality.incomplete_retry_count = incomplete_retry_count;
                     state.pool.set_quality(&proxy.id, quality);
+                    true
                 }
                 Err(e) => {
                     tracing::warn!("Quality check failed for {}: {e}", proxy.name);
+                    false
                 }
             }
         });
@@ -211,7 +217,7 @@ async fn check_batch(
 
     let mut count = 0;
     for handle in handles {
-        if handle.await.is_ok() {
+        if matches!(handle.await, Ok(true)) {
             count += 1;
         }
     }
@@ -219,30 +225,45 @@ async fn check_batch(
 }
 
 /// Check if a proxy needs a quality check: no quality data, incomplete data, or stale.
-pub(crate) fn needs_quality_check(proxy: &PoolProxy, now: &chrono::DateTime<chrono::Utc>) -> bool {
+pub(crate) fn needs_quality_check(
+    proxy: &PoolProxy,
+    now: &chrono::DateTime<chrono::Utc>,
+    stale_hours: u64,
+) -> bool {
     match &proxy.quality {
         None => true,
         Some(q) => {
-            // Incomplete data → retry
-            if quality_is_incomplete(q) {
-                if q.incomplete_retry_count >= MAX_INCOMPLETE_RETRIES {
-                    return false;
-                }
+            // An expired record is due even after its short-term incomplete retry
+            // budget was exhausted. Otherwise an incomplete record could remain
+            // excluded forever.
+            if quality_checked_at_is_stale(q.checked_at.as_deref(), now, stale_hours) {
                 return true;
             }
-            match &q.checked_at {
-                None => true,
-                Some(checked_at) => {
-                    match chrono::DateTime::parse_from_rfc3339(checked_at) {
-                        Ok(t) => {
-                            let age = *now - t.with_timezone(&chrono::Utc);
-                            age.num_hours() >= STALE_HOURS
-                        }
-                        Err(_) => true, // unparseable → re-check
-                    }
-                }
+
+            // Fresh but incomplete data gets a small immediate retry budget.
+            if quality_is_incomplete(q) {
+                return q.incomplete_retry_count < MAX_INCOMPLETE_RETRIES;
             }
+
+            false
         }
+    }
+}
+
+pub(crate) fn quality_checked_at_is_stale(
+    checked_at: Option<&str>,
+    now: &chrono::DateTime<chrono::Utc>,
+    stale_hours: u64,
+) -> bool {
+    let Some(checked_at) = checked_at else {
+        return true;
+    };
+    match chrono::DateTime::parse_from_rfc3339(checked_at) {
+        Ok(checked_at) => {
+            *now - checked_at.with_timezone(&chrono::Utc)
+                >= chrono::Duration::hours(stale_hours.max(1) as i64)
+        }
+        Err(_) => true,
     }
 }
 
@@ -563,4 +584,61 @@ fn shorten_detail(detail: String) -> String {
         return detail;
     }
     detail.chars().take(MAX_LEN).collect::<String>() + "..."
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proxy_with_quality(checked_at: Option<String>, incomplete_retries: u8) -> PoolProxy {
+        PoolProxy {
+            id: "proxy-1".into(),
+            subscription_id: "sub-1".into(),
+            name: "test".into(),
+            proxy_type: "vmess".into(),
+            server: "example.com".into(),
+            port: 443,
+            singbox_outbound: serde_json::json!({}),
+            status: crate::pool::manager::ProxyStatus::Valid,
+            local_port: Some(10001),
+            error_count: 0,
+            quality: Some(ProxyQualityInfo {
+                ip_address: None,
+                country: None,
+                ip_type: None,
+                is_residential: false,
+                chatgpt_accessible: false,
+                google_accessible: false,
+                risk_score: 0.5,
+                risk_level: "Unknown".into(),
+                checked_at,
+                incomplete_retry_count: incomplete_retries,
+            }),
+        }
+    }
+
+    #[test]
+    fn fresh_incomplete_quality_stops_after_retry_budget() {
+        let now = chrono::Utc::now();
+        let proxy = proxy_with_quality(Some(now.to_rfc3339()), MAX_INCOMPLETE_RETRIES);
+        assert!(!needs_quality_check(&proxy, &now, 24));
+    }
+
+    #[test]
+    fn stale_incomplete_quality_is_due_again() {
+        let now = chrono::Utc::now();
+        let checked_at = (now - chrono::Duration::hours(25)).to_rfc3339();
+        let proxy = proxy_with_quality(Some(checked_at), MAX_INCOMPLETE_RETRIES);
+        assert!(needs_quality_check(&proxy, &now, 24));
+    }
+
+    #[test]
+    fn stale_threshold_uses_exact_duration() {
+        let now = chrono::Utc::now();
+        let fresh = (now - chrono::Duration::minutes(90)).to_rfc3339();
+        let stale = (now - chrono::Duration::hours(2)).to_rfc3339();
+        assert!(!quality_checked_at_is_stale(Some(&fresh), &now, 2));
+        assert!(quality_checked_at_is_stale(Some(&stale), &now, 2));
+        assert!(quality_checked_at_is_stale(Some("invalid"), &now, 2));
+    }
 }

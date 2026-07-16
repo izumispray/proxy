@@ -202,6 +202,7 @@ async fn record_relay_failure(
         state.binding_usage.remove(&proxy.id);
         state.pool.remove(&proxy.id);
         state.db.delete_proxy(&proxy.id).ok();
+        crate::api::fetch::invalidate_stats_cache(state.as_ref());
         crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
         return;
     }
@@ -209,6 +210,7 @@ async fn record_relay_failure(
     state.pool.increment_error(&proxy.id);
     state.pool.set_status(&proxy.id, ProxyStatus::Untested);
     state.db.mark_proxy_relay_failed(&proxy.id, error).ok();
+    crate::api::fetch::invalidate_stats_cache(state.as_ref());
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
 }
 
