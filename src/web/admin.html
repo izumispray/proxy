@@ -110,12 +110,12 @@ tr:hover td { background:rgba(108,99,255,.03); }
 <div class="container">
   <!-- Stats -->
   <div class="stat-grid" id="stats">
-    <div class="stat-card"><div class="stat-value" id="s-total">-</div><div class="stat-label">总代理数</div></div>
-    <div class="stat-card"><div class="stat-value" id="s-valid">-</div><div class="stat-label">有效</div></div>
+    <div class="stat-card"><div class="stat-value" id="s-total">-</div><div class="stat-label">当前节点</div></div>
+    <div class="stat-card"><div class="stat-value" id="s-valid">-</div><div class="stat-label">当前有效</div></div>
     <div class="stat-card"><div class="stat-value" id="s-invalid">-</div><div class="stat-label">无效</div></div>
     <div class="stat-card"><div class="stat-value" id="s-untested">-</div><div class="stat-label">待检测</div></div>
     <div class="stat-card"><div class="stat-value" id="s-subs">-</div><div class="stat-label">订阅源</div></div>
-    <div class="stat-card"><div class="stat-value" id="s-quality">-</div><div class="stat-label">已质检</div></div>
+    <div class="stat-card"><div class="stat-value" id="s-quality">-</div><div class="stat-label">当前有效已质检</div></div>
     <div class="stat-card"><div class="stat-value" id="s-chatgpt">-</div><div class="stat-label">ChatGPT</div></div>
     <div class="stat-card"><div class="stat-value" id="s-google">-</div><div class="stat-label">Google</div></div>
     <div class="stat-card"><div class="stat-value" id="s-residential">-</div><div class="stat-label">住宅IP</div></div>
@@ -258,6 +258,7 @@ tr:hover td { background:rgba(108,99,255,.03); }
           <th>ChatGPT</th>
           <th>Google</th>
           <th>住宅</th>
+          <th>质检时间</th>
           <th>操作</th>
         </tr></thead>
         <tbody id="proxy-table"></tbody>
@@ -584,6 +585,7 @@ function renderProxies() {
       <td>${q?(q.chatgpt?yes:no):na}</td>
       <td>${q?(q.google?yes:no):na}</td>
       <td>${q?(q.is_residential?yes:no):na}</td>
+      <td>${q&&q.checked_at?fmtDate(q.checked_at):'-'}</td>
       <td><button class="btn btn-danger btn-sm" onclick="deleteProxy('${p.id}')">删除</button></td>
     </tr>`;
   }).join('');

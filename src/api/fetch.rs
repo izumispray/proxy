@@ -136,6 +136,7 @@ fn proxy_to_json(p: &crate::pool::manager::PoolProxy) -> serde_json::Value {
             "google": q.google_accessible,
             "risk_score": q.risk_score,
             "risk_level": q.risk_level,
+            "checked_at": q.checked_at,
         })),
     })
 }
@@ -160,6 +161,7 @@ pub fn proxy_list_item_to_json(p: &crate::db::ProxyListItem) -> serde_json::Valu
             "google": q.google_accessible,
             "risk_score": q.risk_score,
             "risk_level": q.risk_level,
+            "checked_at": q.checked_at,
         })),
     })
 }

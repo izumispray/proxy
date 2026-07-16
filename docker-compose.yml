@@ -34,6 +34,7 @@ services:
       RUST_LOG: "${RUST_LOG:-zenproxy=info,tower_http=info}"
       ZENPROXY_DATABASE_URL: "postgresql://${POSTGRES_USER:-zenproxy}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-zenproxy}"
       ZENPROXY_ADMIN_PASSWORD: "${ZENPROXY_ADMIN_PASSWORD:-change-me}"
+      ZENPROXY_SUBSCRIPTION_PASSWORD: "${ZENPROXY_SUBSCRIPTION_PASSWORD:-change-subscription-password}"
       ZENPROXY_OAUTH_CLIENT_ID: "${ZENPROXY_OAUTH_CLIENT_ID:-}"
       ZENPROXY_OAUTH_CLIENT_SECRET: "${ZENPROXY_OAUTH_CLIENT_SECRET:-}"
       ZENPROXY_OAUTH_REDIRECT_URI: "${ZENPROXY_OAUTH_REDIRECT_URI:-http://localhost/api/auth/callback}"

@@ -108,6 +108,7 @@ concurrency = 10
 timeout_secs = 600
 
 [subscription]
+password = "change-subscription-password" # 订阅下载密码（请与管理密码不同）
 auto_refresh_interval_mins = 0
 orphaned_valid_grace_hours = 24
 export_cache_secs = 60
@@ -127,6 +128,7 @@ export_cache_secs = 60
 | OAuth 会话 | Web 页面 | Cookie: `zenproxy_session=...`（7 天有效） |
 | API Key | 程序调用 | Query: `?api_key=xxx` 或 Header: `Authorization: Bearer xxx` |
 | 管理密码 | 管理后台 | Header: `Authorization: Bearer {admin_password}` |
+| 订阅密码 | 下载客户端订阅 | URL path: `/sub/{subscription_password}/...` |
 
 OAuth 使用 Discord 作为身份提供商。用户必须已加入 `oauth.required_guild_id` 指定的服务器，登录后才会获得 API Key。
 
@@ -365,16 +367,16 @@ GET /api/proxies?api_key=xxx
 
 #### 客户端订阅（/sub）
 
-订阅链接只返回已验活且仍属于当前订阅源的代理，鉴权 token 复用 `server.admin_password`。
+订阅链接只返回已验活且仍属于当前订阅源的代理，并使用独立的 `subscription.password` 鉴权。该密码只用于订阅下载 URL，不能访问管理接口。也可通过 `ZENPROXY_SUBSCRIPTION_PASSWORD` 设置；旧配置未设置时暂时回退到 `server.admin_password`，升级后建议立即补上独立密码。
 
 ```
-https://proxy.mui.moe/sub/{admin_password}/all
-https://proxy.mui.moe/sub/{admin_password}/vless/clash.yaml
-https://proxy.mui.moe/sub/{admin_password}/vmess/clash.yaml
-https://proxy.mui.moe/sub/{admin_password}/trojan/clash.yaml
+https://proxy.mui.moe/sub/{subscription_password}/all
+https://proxy.mui.moe/sub/{subscription_password}/vless/clash.yaml
+https://proxy.mui.moe/sub/{subscription_password}/vmess/clash.yaml
+https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 ```
 
-`all` 返回全部协议类型；也可以使用 `vless`、`vmess`、`trojan`、`shadowsocks`、`hysteria2`、`socks`、`http` 按协议筛选。默认输出 Clash YAML，`/clash.yaml` 后缀用于显式区分客户端格式。
+`all` 返回全部已支持的真实代理节点；也可以使用 `vless`、`vmess`、`trojan`、`shadowsocks`、`hysteria2`、`socks`、`http` 按协议筛选。默认输出只含顶层 `proxies` 节点列表的 Clash YAML，不包含 `proxy-groups`、`rules`、`direct`、`reject` 等策略或特殊类型，方便导入其他软件；`/clash.yaml` 后缀用于显式区分客户端格式。
 
 服务端会在验证、刷新订阅、删除代理或 relay 将代理降级时清空订阅缓存；平时生成结果按 `[subscription] export_cache_secs` 缓存，默认 60 秒，设为 0 表示每次实时生成。
 

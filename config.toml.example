@@ -41,6 +41,7 @@ concurrency = 10
 timeout_secs = 600
 
 [subscription]
+password = "change-subscription-password"
 auto_refresh_interval_mins = 0
 orphaned_valid_grace_hours = 24
 export_cache_secs = 60

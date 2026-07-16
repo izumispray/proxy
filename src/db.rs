@@ -122,7 +122,7 @@ pub struct Session {
     pub expires_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProxyListQuery {
     pub page: usize,
     pub page_size: usize,
@@ -274,6 +274,11 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_proxies_untested_selection
                     ON proxies(error_count ASC, created_at DESC)
                     WHERE is_valid = FALSE AND last_validated IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_proxies_current_untested_selection
+                    ON proxies(error_count DESC, created_at ASC)
+                    WHERE is_valid = FALSE
+                      AND last_validated IS NULL
+                      AND orphaned_at IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_proxies_invalid_retry
                     ON proxies(error_count ASC, updated_at DESC)
                     WHERE is_valid = FALSE AND last_validated IS NOT NULL;
@@ -669,9 +674,10 @@ impl Database {
         &self,
         limit: usize,
         stale_before: &str,
-        _max_incomplete_retries: u8,
+        max_incomplete_retries: u8,
     ) -> Result<Vec<(ProxyRow, Option<ProxyQuality>)>, postgres::Error> {
         let limit = limit.max(1) as i64;
+        let max_incomplete_retries = max_incomplete_retries as i32;
         self.with_conn(|conn| {
             let rows = conn.query(
                 "SELECT
@@ -684,18 +690,22 @@ impl Database {
                  FROM proxies p
                  LEFT JOIN proxy_quality q ON q.proxy_id = p.id
                  WHERE p.is_valid = TRUE
+                   AND p.orphaned_at IS NULL
                    AND (
                         q.proxy_id IS NULL
                         OR q.checked_at <= $1
-                        OR (q.country IS NULL OR q.ip_type IS NULL OR q.ip_address IS NULL OR q.risk_level = 'Unknown')
+                        OR (
+                            (q.country IS NULL OR q.ip_type IS NULL OR q.ip_address IS NULL OR q.risk_level = 'Unknown')
+                            AND COALESCE((q.extra_json::jsonb ->> 'incomplete_retry_count')::int, 0) < $2
+                        )
                    )
                  ORDER BY
                     CASE WHEN p.local_port IS NULL THEN 1 ELSE 0 END ASC,
                     q.checked_at ASC NULLS FIRST,
                     p.last_validated DESC NULLS LAST,
                     p.updated_at DESC
-                 LIMIT $2",
-                &[&stale_before, &limit],
+                 LIMIT $3",
+                &[&stale_before, &max_incomplete_retries, &limit],
             )?;
             Ok(rows.iter().map(proxy_record_from_join_row).collect())
         })
@@ -840,7 +850,10 @@ impl Database {
         self.with_conn(|conn| {
             let count: i64 = conn
                 .query_one(
-                    "SELECT COUNT(*) FROM proxies WHERE is_valid = FALSE AND last_validated IS NULL",
+                    "SELECT COUNT(*) FROM proxies
+                     WHERE is_valid = FALSE
+                       AND last_validated IS NULL
+                       AND orphaned_at IS NULL",
                     &[],
                 )?
                 .get(0);
@@ -879,7 +892,15 @@ impl Database {
             Ok(count as usize)
         })?;
 
-        let total = self.count_all_proxies()?;
+        // The admin/user list represents the current subscription contents.
+        // Orphaned rows are retained internally for smooth refresh/rechecking,
+        // but are not eligible for export and must not inflate the UI totals.
+        let total = self.with_conn(|conn| {
+            let count: i64 = conn
+                .query_one("SELECT COUNT(*) FROM proxies WHERE orphaned_at IS NULL", &[])?
+                .get(0);
+            Ok(count as usize)
+        })?;
         let total_pages = if filtered == 0 {
             0
         } else {
@@ -1189,55 +1210,60 @@ impl Database {
 
     pub fn get_stats(&self) -> Result<serde_json::Value, postgres::Error> {
         self.with_conn(|conn| {
-            let total: i64 = conn.query_one("SELECT COUNT(*) FROM proxies", &[])?.get(0);
-            let valid: i64 = conn
-                .query_one("SELECT COUNT(*) FROM proxies WHERE is_valid = TRUE", &[])?
-                .get(0);
-            let untested: i64 = conn
-                .query_one(
-                    "SELECT COUNT(*) FROM proxies WHERE is_valid = FALSE AND last_validated IS NULL",
-                    &[],
-                )?
-                .get(0);
-            let invalid: i64 = conn
-                .query_one(
-                    "SELECT COUNT(*) FROM proxies WHERE is_valid = FALSE AND last_validated IS NOT NULL",
-                    &[],
-                )?
-                .get(0);
+            // Keep dashboard statistics aligned with subscription export/listing:
+            // orphaned proxies are internal refresh fallbacks, not current nodes.
+            let proxy_counts = conn.query_one(
+                "SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE is_valid = TRUE) AS valid,
+                    COUNT(*) FILTER (
+                        WHERE is_valid = FALSE AND last_validated IS NULL
+                    ) AS untested,
+                    COUNT(*) FILTER (
+                        WHERE is_valid = FALSE AND last_validated IS NOT NULL
+                    ) AS invalid
+                 FROM proxies
+                 WHERE orphaned_at IS NULL",
+                &[],
+            )?;
+            let total: i64 = proxy_counts.get("total");
+            let valid: i64 = proxy_counts.get("valid");
+            let untested: i64 = proxy_counts.get("untested");
+            let invalid: i64 = proxy_counts.get("invalid");
             let subs: i64 = conn
                 .query_one("SELECT COUNT(*) FROM subscriptions", &[])?
                 .get(0);
-            let quality_checked: i64 = conn
-                .query_one("SELECT COUNT(*) FROM proxy_quality", &[])?
-                .get(0);
-            let chatgpt_accessible: i64 = conn
-                .query_one(
-                    "SELECT COUNT(*) FROM proxy_quality WHERE chatgpt_accessible = TRUE",
-                    &[],
-                )?
-                .get(0);
-            let google_accessible: i64 = conn
-                .query_one(
-                    "SELECT COUNT(*) FROM proxy_quality WHERE google_accessible = TRUE",
-                    &[],
-                )?
-                .get(0);
-            let residential: i64 = conn
-                .query_one(
-                    "SELECT COUNT(*) FROM proxy_quality WHERE is_residential = TRUE",
-                    &[],
-                )?
-                .get(0);
+            let quality_counts = conn.query_one(
+                "SELECT
+                    COUNT(*) AS quality_checked,
+                    COUNT(*) FILTER (WHERE q.chatgpt_accessible = TRUE) AS chatgpt_accessible,
+                    COUNT(*) FILTER (WHERE q.google_accessible = TRUE) AS google_accessible,
+                    COUNT(*) FILTER (WHERE q.is_residential = TRUE) AS residential
+                 FROM proxy_quality q
+                 JOIN proxies p ON p.id = q.proxy_id
+                 WHERE p.is_valid = TRUE AND p.orphaned_at IS NULL",
+                &[],
+            )?;
+            let quality_checked: i64 = quality_counts.get("quality_checked");
+            let chatgpt_accessible: i64 = quality_counts.get("chatgpt_accessible");
+            let google_accessible: i64 = quality_counts.get("google_accessible");
+            let residential: i64 = quality_counts.get("residential");
 
             let by_type_rows = conn.query(
-                "SELECT proxy_type, COUNT(*) FROM proxies GROUP BY proxy_type",
+                "SELECT proxy_type, COUNT(*)
+                 FROM proxies
+                 WHERE orphaned_at IS NULL
+                 GROUP BY proxy_type",
                 &[],
             )?;
             let by_country_rows = conn.query(
-                "SELECT country, COUNT(*) FROM proxy_quality
-                 WHERE country IS NOT NULL
-                 GROUP BY country
+                "SELECT q.country, COUNT(*)
+                 FROM proxy_quality q
+                 JOIN proxies p ON p.id = q.proxy_id
+                 WHERE p.is_valid = TRUE
+                   AND p.orphaned_at IS NULL
+                   AND q.country IS NOT NULL
+                 GROUP BY q.country
                  ORDER BY COUNT(*) DESC",
                 &[],
             )?;
@@ -1577,7 +1603,9 @@ fn build_proxy_list_where(
     query: &ProxyListQuery,
     params: &mut Vec<Box<dyn ToSql + Sync>>,
 ) -> String {
-    let mut conditions = Vec::new();
+    // Orphaned rows exist only as a short-lived refresh fallback. They are not
+    // part of the current subscription and are excluded from export as well.
+    let mut conditions = vec!["p.orphaned_at IS NULL".to_string()];
 
     if let Some(search) = query.search.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         params.push(Box::new(format!("%{search}%")));
@@ -1727,7 +1755,10 @@ fn proxy_list_sort_expr(sort: Option<&str>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_fetch_proxy_where, build_random_valid_proxy_order_by};
+    use super::{
+        build_fetch_proxy_where, build_proxy_list_where, build_random_valid_proxy_order_by,
+        ProxyListQuery,
+    };
     use crate::pool::manager::ProxyFilter;
     use postgres::types::ToSql;
 
@@ -1739,6 +1770,17 @@ mod tests {
         let clause = build_fetch_proxy_where(&filter, &mut params, true);
 
         assert_eq!(clause, "WHERE p.is_valid = TRUE");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn proxy_list_excludes_internal_orphaned_rows() {
+        let query = ProxyListQuery::default();
+        let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
+
+        let clause = build_proxy_list_where(&query, &mut params);
+
+        assert_eq!(clause, "WHERE p.orphaned_at IS NULL");
         assert!(params.is_empty());
     }
 

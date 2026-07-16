@@ -5,12 +5,11 @@ use crate::{AppState, SubscriptionExportCacheEntry};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 const CONTENT_TYPE_CLASH: &str = "application/x-yaml; charset=utf-8";
-const FALLBACK_PROXY_GROUP_MEMBER: &str = "DIRECT";
 
 #[derive(Debug, Clone, Copy)]
 enum ExportFormat {
@@ -77,7 +76,7 @@ async fn export_subscription(
     selector: String,
     format: ExportFormat,
 ) -> Result<Response, AppError> {
-    if token != state.config.server.admin_password.as_str() {
+    if token != state.config.subscription_password() {
         return Err(AppError::Unauthorized("Invalid subscription token".into()));
     }
 
@@ -100,10 +99,9 @@ async fn export_subscription(
     }
 
     let rows = state.db.get_valid_export_proxies(selector.db_type())?;
-    let body = match format {
+    let (body, proxy_count) = match format {
         ExportFormat::Clash => build_clash_yaml(&rows)?,
     };
-    let proxy_count = rows.len();
 
     if cache_ttl_secs > 0 {
         state.subscription_export_cache.insert(
@@ -158,10 +156,9 @@ fn build_response(
     response
 }
 
-fn build_clash_yaml(rows: &[ProxyRow]) -> Result<String, AppError> {
+fn build_clash_yaml(rows: &[ProxyRow]) -> Result<(String, usize), AppError> {
     let mut used_names = HashMap::new();
     let mut proxies = Vec::new();
-    let mut proxy_names = Vec::new();
 
     for row in rows {
         let outbound: Value = match serde_json::from_str(&row.config_json) {
@@ -173,34 +170,18 @@ fn build_clash_yaml(rows: &[ProxyRow]) -> Result<String, AppError> {
         };
         let name = unique_proxy_name(row, &mut used_names);
         if let Some(proxy) = singbox_outbound_to_clash(row, &outbound, &name) {
-            proxy_names.push(name);
             proxies.push(proxy);
         }
     }
 
-    if proxy_names.is_empty() {
-        proxy_names.push(FALLBACK_PROXY_GROUP_MEMBER.to_string());
-    }
-
-    let profile = json!({
-        "mixed-port": 7890,
-        "allow-lan": false,
-        "mode": "rule",
-        "log-level": "info",
-        "proxies": proxies,
-        "proxy-groups": [
-            {
-                "name": "PROXY",
-                "type": "select",
-                "proxies": proxy_names,
-            }
-        ],
-        "rules": [
-            "MATCH,PROXY"
-        ]
-    });
+    let proxy_count = proxies.len();
+    let profile = Value::Object(Map::from_iter([(
+        "proxies".to_string(),
+        Value::Array(proxies),
+    )]));
 
     serde_yaml::to_string(&profile)
+        .map(|body| (body, proxy_count))
         .map_err(|e| AppError::Internal(format!("Failed to build Clash YAML: {e}")))
 }
 
@@ -475,4 +456,64 @@ fn insert_string(map: &mut Map<String, Value>, key: &str, value: &str) {
 
 fn insert_i64(map: &mut Map<String, Value>, key: &str, value: i64) {
     map.insert(key.to_string(), Value::Number(value.into()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_clash_yaml;
+    use crate::db::ProxyRow;
+    use serde_json::json;
+
+    fn proxy_row(proxy_type: &str, config: serde_json::Value) -> ProxyRow {
+        ProxyRow {
+            id: "proxy-1".into(),
+            subscription_id: "subscription-1".into(),
+            name: "Test node".into(),
+            proxy_type: proxy_type.into(),
+            server: "example.com".into(),
+            port: 443,
+            config_json: config.to_string(),
+            is_valid: true,
+            local_port: None,
+            error_count: 0,
+            last_error: None,
+            last_validated: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            orphaned_at: None,
+        }
+    }
+
+    #[test]
+    fn clash_export_contains_only_real_proxy_nodes() {
+        let rows = vec![
+            proxy_row(
+                "vmess",
+                json!({
+                    "type": "vmess",
+                    "server": "example.com",
+                    "server_port": 443,
+                    "uuid": "00000000-0000-0000-0000-000000000000"
+                }),
+            ),
+            proxy_row("direct", json!({ "type": "direct" })),
+        ];
+
+        let (body, count) = build_clash_yaml(&rows).unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
+        let mapping = yaml.as_mapping().unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(mapping.len(), 1);
+        assert_eq!(
+            mapping
+                .get(&serde_yaml::Value::String("proxies".into()))
+                .and_then(serde_yaml::Value::as_sequence)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(!body.contains("proxy-groups"));
+        assert!(!body.contains("rules:"));
+        assert!(!body.contains("DIRECT"));
+    }
 }

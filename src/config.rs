@@ -142,6 +142,10 @@ fn default_relay_timeout_secs() -> u64 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscriptionConfig {
+    /// Password embedded in client subscription URLs. Older configurations
+    /// without this field fall back to the admin password during migration.
+    #[serde(default)]
+    pub password: Option<String>,
     #[serde(default)]
     pub auto_refresh_interval_mins: u64, // legacy/global default for subscriptions without explicit interval
     #[serde(default = "default_orphaned_valid_grace_hours")]
@@ -153,6 +157,7 @@ pub struct SubscriptionConfig {
 impl Default for SubscriptionConfig {
     fn default() -> Self {
         Self {
+            password: None,
             auto_refresh_interval_mins: 0,
             orphaned_valid_grace_hours: default_orphaned_valid_grace_hours(),
             export_cache_secs: default_export_cache_secs(),
@@ -190,6 +195,9 @@ impl AppConfig {
         set_string_from_env(&mut self.server.host, "ZENPROXY_SERVER_HOST");
         set_u16_from_env(&mut self.server.port, "ZENPROXY_SERVER_PORT")?;
         set_string_from_env(&mut self.server.admin_password, "ZENPROXY_ADMIN_PASSWORD");
+        if let Some(value) = env_value("ZENPROXY_SUBSCRIPTION_PASSWORD") {
+            self.subscription.password = Some(value);
+        }
 
         set_string_from_env(&mut self.database.url, "ZENPROXY_DATABASE_URL");
 
@@ -221,6 +229,14 @@ impl AppConfig {
         }
 
         Ok(())
+    }
+
+    pub fn subscription_password(&self) -> &str {
+        self.subscription
+            .password
+            .as_deref()
+            .filter(|password| !password.is_empty())
+            .unwrap_or(&self.server.admin_password)
     }
 }
 
@@ -254,4 +270,32 @@ fn parse_listener_uri(uri: &str, default_name: &str) -> Option<ProxyListenerConf
         username: username.to_string(),
         password: password.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn reads_independent_subscription_password() {
+        let config: AppConfig = toml::from_str(include_str!("../config.toml.example")).unwrap();
+
+        assert_eq!(
+            config.subscription_password(),
+            "change-subscription-password"
+        );
+        assert_ne!(
+            config.subscription_password(),
+            config.server.admin_password
+        );
+    }
+
+    #[test]
+    fn old_config_falls_back_to_admin_password() {
+        let source = include_str!("../config.toml.example")
+            .replace("password = \"change-subscription-password\"\n", "");
+        let config: AppConfig = toml::from_str(&source).unwrap();
+
+        assert_eq!(config.subscription_password(), "change-me");
+    }
 }
