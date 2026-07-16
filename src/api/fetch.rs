@@ -82,7 +82,9 @@ pub async fn list_all_proxies(
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth::authenticate_request(&state, &headers, query.api_key.as_deref()).await?;
 
-    let page = state.db.list_proxy_page(&list_query_to_db(&query))?;
+    let mut db_query = list_query_to_db(&query);
+    db_query.unique_exit_ip = true;
+    let page = state.db.list_proxy_page(&db_query)?;
     let stats = get_cached_stats(state.as_ref())?;
     let stale_hours = state.config.quality.stale_hours.max(1);
     let proxy_list: Vec<serde_json::Value> = page
@@ -190,6 +192,7 @@ pub fn list_query_to_db(query: &ListProxyQuery) -> ProxyListQuery {
     ProxyListQuery {
         page: query.page.unwrap_or(1),
         page_size: query.page_size.unwrap_or(50),
+        unique_exit_ip: false,
         cursor: query.cursor.clone(),
         direction: query.direction.clone(),
         search: query.search.clone(),
@@ -253,9 +256,10 @@ pub fn pick_random_valid_proxies(
         None
     };
 
-    let records = state
-        .db
-        .get_random_valid_proxy_records(filter, count, recent_error_before.as_deref())?;
+    let records =
+        state
+            .db
+            .get_random_valid_proxy_records(filter, count, recent_error_before.as_deref())?;
     Ok(records
         .into_iter()
         .map(|(row, quality)| crate::pool::manager::ProxyPool::from_db_parts(row, quality))

@@ -3,83 +3,114 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Proxy 管理后台</title>
+<title>ZEN/PROXY 指挥中心</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
-:root { --bg:#0f1117; --card:#1a1d27; --border:#2a2d3a; --primary:#6c63ff; --primary-hover:#5a52e0; --success:#22c55e; --danger:#ef4444; --warn:#f59e0b; --text:#e2e8f0; --text-dim:#94a3b8; --text-bright:#f8fafc; }
-body { font-family:'Segoe UI',system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; }
-.header { background:var(--card); border-bottom:1px solid var(--border); padding:16px 24px; display:flex; align-items:center; justify-content:space-between; }
-.header h1 { font-size:20px; color:var(--text-bright); }
-.header .nav a { color:var(--text-dim); text-decoration:none; margin-left:16px; padding:6px 12px; border-radius:6px; transition:all .2s; }
-.header .nav a:hover, .header .nav a.active { color:var(--primary); background:rgba(108,99,255,.1); }
-.container { max-width:1400px; margin:0 auto; padding:24px; }
-.section { margin-bottom:32px; }
-.section-title { font-size:16px; font-weight:600; color:var(--text-bright); margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; }
-.card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; overflow-x:auto; }
+:root { --bg:#050912; --bg-grid:rgba(71,233,255,.035); --card:rgba(10,19,34,.92); --card-2:#0d192b; --border:#1d4055; --border-hot:#38d9ff; --primary:#46dcff; --primary-hover:#8beaff; --violet:#9b7bff; --success:#4dff9c; --danger:#ff4d6d; --warn:#ffc857; --text:#cfdeeb; --text-dim:#708ca4; --text-bright:#f0fbff; --shadow:0 18px 55px rgba(0,0,0,.42); }
+html { background:var(--bg); }
+body { font-family:"Bahnschrift","Segoe UI",system-ui,-apple-system,sans-serif; background:radial-gradient(circle at 12% -10%,rgba(70,220,255,.12),transparent 30%),radial-gradient(circle at 88% 2%,rgba(155,123,255,.09),transparent 28%),var(--bg); color:var(--text); min-height:100vh; letter-spacing:.01em; }
+body::before { content:""; position:fixed; inset:0; pointer-events:none; z-index:-1; background-image:linear-gradient(var(--bg-grid) 1px,transparent 1px),linear-gradient(90deg,var(--bg-grid) 1px,transparent 1px); background-size:34px 34px; mask-image:linear-gradient(to bottom,#000,transparent 85%); }
+.header { position:sticky; top:0; z-index:40; min-height:76px; background:rgba(5,9,18,.88); backdrop-filter:blur(18px); border-bottom:1px solid var(--border); padding:12px max(24px,calc((100vw - 1540px)/2)); display:flex; align-items:center; justify-content:space-between; box-shadow:0 8px 36px rgba(0,0,0,.26); }
+.brand { display:flex; gap:12px; align-items:center; }
+.brand-mark { width:42px; height:42px; display:grid; place-items:center; color:#041018; background:linear-gradient(135deg,var(--primary),var(--success)); clip-path:polygon(25% 0,75% 0,100% 25%,100% 75%,75% 100%,25% 100%,0 75%,0 25%); font-weight:900; box-shadow:0 0 25px rgba(70,220,255,.28); }
+.header h1 { font-size:17px; color:var(--text-bright); letter-spacing:.11em; }
+.brand-sub { color:var(--text-dim); font:10px/1.3 Consolas,monospace; letter-spacing:.18em; margin-top:3px; }
+.system-live { color:var(--success); }
+.system-live::before { content:""; display:inline-block; width:6px; height:6px; border-radius:50%; margin-right:6px; background:var(--success); box-shadow:0 0 10px var(--success); animation:pulse 1.8s infinite; }
+.header .nav { display:flex; align-items:center; gap:5px; }
+.header .nav a { color:var(--text-dim); text-decoration:none; padding:8px 13px; border:1px solid transparent; font-size:12px; letter-spacing:.08em; transition:all .2s; }
+.header .nav a:hover, .header .nav a.active { color:var(--primary); border-color:rgba(70,220,255,.35); background:rgba(70,220,255,.07); box-shadow:inset 0 -2px var(--primary); }
+.container { max-width:1580px; margin:0 auto; padding:30px 24px 80px; }
+.command-banner { display:flex; align-items:flex-end; justify-content:space-between; gap:24px; margin:0 0 27px; padding:3px 4px 20px; border-bottom:1px solid rgba(70,220,255,.16); }
+.command-banner h2 { font-size:30px; color:var(--text-bright); letter-spacing:.03em; }
+.command-banner p { color:var(--text-dim); font-size:12px; margin-top:7px; }
+.command-clock { text-align:right; color:var(--primary); font:12px/1.7 Consolas,monospace; }
+.section { margin-bottom:30px; }
+.section-title { min-height:28px; font-size:14px; font-weight:700; color:var(--text-bright); margin-bottom:11px; display:flex; align-items:center; justify-content:space-between; letter-spacing:.11em; text-transform:uppercase; }
+.section-title::before { content:"//"; color:var(--primary); font-family:Consolas,monospace; margin-right:9px; }
+.section-title > span:first-child { flex:1; }
+.card { position:relative; background:linear-gradient(145deg,rgba(13,25,43,.96),rgba(7,14,26,.97)); border:1px solid var(--border); border-radius:4px; padding:20px; overflow-x:auto; box-shadow:var(--shadow); }
+.card::after { content:""; position:absolute; pointer-events:none; left:-1px; top:-1px; width:30px; height:2px; background:var(--primary); box-shadow:0 0 12px var(--primary); }
 .grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
-@media(max-width:768px) { .grid-2 { grid-template-columns:1fr; } }
 .form-group { margin-bottom:14px; }
-.form-group label { display:block; font-size:13px; color:var(--text-dim); margin-bottom:6px; }
-.form-group input, .form-group select, .form-group textarea { width:100%; padding:10px 12px; background:#0f1117; border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:14px; outline:none; transition:border .2s; }
-.form-group input:focus, .form-group select:focus, .form-group textarea:focus { border-color:var(--primary); }
+.form-group label { display:block; font-size:11px; color:var(--text-dim); margin-bottom:7px; letter-spacing:.08em; text-transform:uppercase; }
+.form-group input, .form-group select, .form-group textarea { width:100%; padding:10px 12px; background:#07111e; border:1px solid var(--border); border-radius:2px; color:var(--text); font-size:13px; outline:none; transition:border .2s,box-shadow .2s; }
+.form-group input:focus, .form-group select:focus, .form-group textarea:focus { border-color:var(--primary); box-shadow:0 0 0 2px rgba(70,220,255,.08),inset 3px 0 var(--primary); }
 .form-group textarea { resize:vertical; min-height:80px; }
-.btn { padding:10px 20px; border:none; border-radius:8px; font-size:14px; font-weight:500; cursor:pointer; transition:all .2s; display:inline-flex; align-items:center; gap:6px; }
-.btn-primary { background:var(--primary); color:#fff; }
-.btn-primary:hover { background:var(--primary-hover); }
-.btn-danger { background:var(--danger); color:#fff; }
-.btn-danger:hover { opacity:.85; }
-.btn-warn { background:var(--warn); color:#000; }
-.btn-warn:hover { opacity:.85; }
-.btn-success { background:var(--success); color:#fff; }
-.btn-success:hover { opacity:.85; }
+.btn { padding:10px 20px; border:1px solid currentColor; border-radius:2px; font-size:12px; letter-spacing:.06em; font-weight:700; cursor:pointer; transition:all .18s; display:inline-flex; align-items:center; gap:6px; background:transparent; }
+.btn:hover { transform:translateY(-1px); filter:brightness(1.15); box-shadow:0 5px 18px rgba(0,0,0,.25); }
+.btn-primary { color:var(--primary); background:rgba(70,220,255,.08); }
+.btn-primary:hover { background:var(--primary); color:#041018; }
+.btn-danger { color:var(--danger); background:rgba(255,77,109,.08); }
+.btn-danger:hover { background:var(--danger); color:#16040a; }
+.btn-warn { color:var(--warn); background:rgba(255,200,87,.08); }
+.btn-warn:hover { background:var(--warn); color:#181004; }
+.btn-success { color:var(--success); background:rgba(77,255,156,.08); }
+.btn-success:hover { background:var(--success); color:#03150b; }
 .btn-sm { padding:6px 12px; font-size:12px; }
 .btn-group { display:flex; gap:8px; flex-wrap:wrap; }
 table { width:100%; border-collapse:collapse; }
-th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); font-size:13px; white-space:nowrap; }
-th { color:var(--text-dim); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.5px; cursor:pointer; user-select:none; }
-th:hover { color:var(--text); }
+th, td { text-align:left; padding:11px 12px; border-bottom:1px solid rgba(29,64,85,.62); font-size:12px; white-space:nowrap; }
+th { position:sticky; top:0; z-index:2; color:#719bb5; background:#0a1728; font-weight:700; font-size:10px; text-transform:uppercase; letter-spacing:.09em; cursor:pointer; user-select:none; }
+th:hover { color:var(--primary); }
 th.sorted-asc::after { content:' ↑'; }
 th.sorted-desc::after { content:' ↓'; }
-tr:hover td { background:rgba(108,99,255,.03); }
-.badge { display:inline-block; padding:3px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+tr:hover td { background:rgba(70,220,255,.035); }
+.badge { display:inline-block; padding:3px 8px; border:1px solid currentColor; border-radius:2px; font-size:10px; font-weight:700; letter-spacing:.03em; }
 .badge-valid { background:rgba(34,197,94,.15); color:var(--success); }
 .badge-invalid { background:rgba(239,68,68,.15); color:var(--danger); }
 .badge-untested { background:rgba(245,158,11,.15); color:var(--warn); }
-.badge-type { background:rgba(108,99,255,.15); color:var(--primary); }
+.badge-type { background:rgba(155,123,255,.15); color:#b8a8ff; }
 .badge-quality { background:rgba(245,158,11,.15); color:var(--warn); }
 .badge-risk-low { background:rgba(34,197,94,.15); color:var(--success); }
 .badge-risk-med { background:rgba(245,158,11,.15); color:var(--warn); }
 .badge-risk-high { background:rgba(239,68,68,.15); color:var(--danger); }
 .badge-banned { background:rgba(239,68,68,.15); color:var(--danger); }
 .badge-active { background:rgba(34,197,94,.15); color:var(--success); }
-.stat-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:24px; }
-.stat-card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; text-align:center; }
-.stat-value { font-size:28px; font-weight:700; color:var(--text-bright); }
-.stat-label { font-size:12px; color:var(--text-dim); margin-top:4px; }
-.toast { position:fixed; bottom:24px; right:24px; background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 20px; font-size:14px; z-index:999; animation:slideIn .3s ease; }
+.stat-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); gap:10px; margin-bottom:27px; }
+.stat-card { position:relative; background:linear-gradient(150deg,rgba(14,29,48,.96),rgba(7,14,25,.96)); border:1px solid var(--border); border-radius:3px; min-height:104px; padding:19px 16px 14px; overflow:hidden; }
+.stat-card::before { content:attr(data-code); position:absolute; right:9px; top:7px; color:rgba(70,220,255,.34); font:9px Consolas,monospace; letter-spacing:.12em; }
+.stat-card::after { content:""; position:absolute; bottom:0; left:0; height:2px; width:34%; background:var(--primary); box-shadow:0 0 14px rgba(70,220,255,.7); transition:width .25s; }
+.stat-card:hover::after { width:100%; }
+.stat-card[data-tone="success"]::after { background:var(--success); }
+.stat-card[data-tone="danger"]::after { background:var(--danger); }
+.stat-card[data-tone="warn"]::after { background:var(--warn); }
+.stat-card[data-tone="violet"]::after { background:var(--violet); }
+.stat-value { font:700 28px/1.15 Consolas,"Segoe UI",sans-serif; color:var(--text-bright); text-shadow:0 0 18px rgba(70,220,255,.12); }
+.stat-label { font-size:10px; color:var(--text-dim); margin-top:8px; letter-spacing:.09em; text-transform:uppercase; }
+.toast { position:fixed; bottom:24px; right:24px; max-width:min(430px,calc(100vw - 48px)); background:#0c1b2c; color:var(--text-bright); border:1px solid var(--primary); border-radius:2px; padding:13px 20px; font-size:13px; z-index:999; box-shadow:0 0 30px rgba(70,220,255,.16); animation:slideIn .3s ease; }
 @keyframes slideIn { from { transform:translateY(20px); opacity:0; } to { transform:translateY(0); opacity:1; } }
 .filter-bar { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; align-items:center; }
-.filter-bar input, .filter-bar select { padding:8px 12px; background:#0f1117; border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:13px; outline:none; }
+.filter-bar input, .filter-bar select { padding:9px 12px; background:#07111e; border:1px solid var(--border); border-radius:2px; color:var(--text); font-size:12px; outline:none; }
 .filter-bar input:focus, .filter-bar select:focus { border-color:var(--primary); }
 .empty { text-align:center; color:var(--text-dim); padding:40px; }
 .type-chips { display:flex; gap:8px; flex-wrap:wrap; }
-.type-chip { padding:4px 10px; border-radius:6px; font-size:12px; background:rgba(108,99,255,.1); color:var(--primary); }
+.type-chip { padding:6px 11px; border-radius:2px; border-left:2px solid var(--violet); font:11px Consolas,monospace; background:rgba(155,123,255,.09); color:#b8a8ff; }
 /* Login overlay */
-.login-overlay { position:fixed; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center; z-index:1000; }
-.login-box { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:40px; width:360px; text-align:center; }
-.login-box h2 { font-size:22px; color:var(--text-bright); margin-bottom:8px; }
+.login-overlay { position:fixed; inset:0; background:radial-gradient(circle at 50% 30%,rgba(70,220,255,.12),transparent 32%),var(--bg); display:flex; align-items:center; justify-content:center; z-index:1000; }
+.login-box { position:relative; background:linear-gradient(145deg,#0e1c30,#07101d); border:1px solid var(--border-hot); border-radius:3px; padding:45px 40px 40px; width:min(390px,calc(100vw - 32px)); text-align:center; box-shadow:0 0 70px rgba(70,220,255,.13); }
+.login-box::before { content:"SECURE TERMINAL // AUTH_01"; position:absolute; top:11px; left:14px; color:var(--primary); font:9px Consolas,monospace; letter-spacing:.12em; }
+.login-box h2 { font-size:22px; color:var(--text-bright); margin-bottom:8px; letter-spacing:.08em; }
 .login-box p { font-size:13px; color:var(--text-dim); margin-bottom:24px; }
-.login-box input { width:100%; padding:12px 16px; background:#0f1117; border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:14px; outline:none; margin-bottom:16px; }
+.login-box input { width:100%; padding:12px 16px; background:#050b14; border:1px solid var(--border); border-radius:2px; color:var(--text); font:14px Consolas,monospace; outline:none; margin-bottom:16px; }
 .login-box input:focus { border-color:var(--primary); }
 .login-box .btn { width:100%; justify-content:center; }
 .login-error { color:var(--danger); font-size:13px; margin-bottom:12px; display:none; }
 .api-key-cell { max-width:120px; overflow:hidden; text-overflow:ellipsis; font-family:'Consolas','Courier New',monospace; font-size:11px; }
 .pagination { display:flex; align-items:center; justify-content:center; gap:4px; padding:16px 0 0; flex-wrap:wrap; }
-.pagination button { background:transparent; border:1px solid var(--border); color:var(--text-dim); border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; transition:all .2s; }
+.pagination button { background:transparent; border:1px solid var(--border); color:var(--text-dim); border-radius:2px; padding:7px 13px; font-size:12px; cursor:pointer; transition:all .2s; }
 .pagination button:hover { border-color:var(--primary); color:var(--primary); }
 .pagination button.active { background:var(--primary); border-color:var(--primary); color:#fff; }
 .pagination button:disabled { opacity:.4; cursor:default; }
 .pagination .page-info { font-size:13px; color:var(--text-dim); margin:0 8px; }
+.overlap-list { display:flex; gap:4px; flex-wrap:wrap; max-width:300px; }
+.overlap-chip { color:var(--warn); border:1px solid rgba(255,200,87,.3); background:rgba(255,200,87,.07); padding:3px 6px; font-size:10px; }
+.metric-pair { display:flex; align-items:baseline; gap:5px; }
+.metric-pair strong { color:var(--text-bright); font:700 14px Consolas,monospace; }
+.metric-pair small { color:var(--text-dim); font-size:10px; }
+@keyframes pulse { 50% { opacity:.35; box-shadow:0 0 2px var(--success); } }
+@media(max-width:900px) { .header { position:relative; align-items:flex-start; gap:12px; } .header .nav { flex-wrap:wrap; justify-content:flex-end; } .command-banner { align-items:flex-start; } .command-banner h2 { font-size:24px; } }
+@media(max-width:650px) { .grid-2 { grid-template-columns:1fr; } .header { padding:13px 16px; flex-direction:column; } .header .nav { justify-content:flex-start; } .container { padding:22px 12px 60px; } .command-banner { display:block; } .command-clock { display:none; } .stat-grid { grid-template-columns:repeat(2,1fr); } .card { padding:13px; } }
 </style>
 </head>
 <body>
@@ -87,8 +118,8 @@ tr:hover td { background:rgba(108,99,255,.03); }
 <!-- Login Screen -->
 <div class="login-overlay" id="login-overlay">
   <div class="login-box">
-    <h2>Proxy 管理后台</h2>
-    <p>请输入管理员密码以继续</p>
+    <h2>ZEN/PROXY</h2>
+    <p>管理员身份验证 · 请输入访问密钥</p>
     <div class="login-error" id="login-error">密码错误，请重试</div>
     <input type="password" id="login-password" placeholder="输入密码..." onkeydown="if(event.key==='Enter')doLogin()">
     <button class="btn btn-primary" onclick="doLogin()">登录</button>
@@ -98,7 +129,10 @@ tr:hover td { background:rgba(108,99,255,.03); }
 <!-- Main App -->
 <div id="app" style="display:none">
 <div class="header">
-  <h1>Proxy 管理后台</h1>
+  <div class="brand">
+    <div class="brand-mark">Z</div>
+    <div><h1>ZEN/PROXY 指挥中心</h1><div class="brand-sub"><span class="system-live">SYSTEM ONLINE</span> · NODE CONTROL</div></div>
+  </div>
   <div class="nav">
     <a href="/">仪表盘</a>
     <a href="/admin" class="active">管理后台</a>
@@ -108,18 +142,24 @@ tr:hover td { background:rgba(108,99,255,.03); }
 </div>
 
 <div class="container">
+  <div class="command-banner">
+    <div><h2>代理网络总览</h2><p>节点库存、出口质量与订阅关系的统一作战界面</p></div>
+    <div class="command-clock"><div id="command-time">--:--:--</div><div>ASIA/SHANGHAI · LIVE TELEMETRY</div></div>
+  </div>
   <!-- Stats -->
   <div class="stat-grid" id="stats">
-    <div class="stat-card"><div class="stat-value" id="s-total">-</div><div class="stat-label">当前节点</div></div>
-    <div class="stat-card"><div class="stat-value" id="s-valid">-</div><div class="stat-label">当前有效</div></div>
-    <div class="stat-card"><div class="stat-value" id="s-invalid">-</div><div class="stat-label">无效</div></div>
-    <div class="stat-card"><div class="stat-value" id="s-untested">-</div><div class="stat-label">待检测</div></div>
-    <div class="stat-card"><div class="stat-value" id="s-subs">-</div><div class="stat-label">订阅源</div></div>
-    <div class="stat-card"><div class="stat-value" id="s-quality">-</div><div class="stat-label">当前有效已质检</div></div>
-    <div class="stat-card"><div class="stat-value" id="s-chatgpt">-</div><div class="stat-label">ChatGPT</div></div>
-    <div class="stat-card"><div class="stat-value" id="s-google">-</div><div class="stat-label">Google</div></div>
-    <div class="stat-card"><div class="stat-value" id="s-residential">-</div><div class="stat-label">住宅IP</div></div>
-    <div class="stat-card"><div class="stat-value" id="s-users">-</div><div class="stat-label">注册用户</div></div>
+    <div class="stat-card" data-code="INV-01"><div class="stat-value" id="s-total">-</div><div class="stat-label">当前节点</div></div>
+    <div class="stat-card" data-code="OK-02" data-tone="success"><div class="stat-value" id="s-valid">-</div><div class="stat-label">当前有效</div></div>
+    <div class="stat-card" data-code="ERR-03" data-tone="danger"><div class="stat-value" id="s-invalid">-</div><div class="stat-label">无效</div></div>
+    <div class="stat-card" data-code="WAIT-04" data-tone="warn"><div class="stat-value" id="s-untested">-</div><div class="stat-label">待检测</div></div>
+    <div class="stat-card" data-code="SUB-05" data-tone="violet"><div class="stat-value" id="s-subs">-</div><div class="stat-label">订阅源</div></div>
+    <div class="stat-card" data-code="QA-06"><div class="stat-value" id="s-quality">-</div><div class="stat-label">当前有效已质检</div></div>
+    <div class="stat-card" data-code="AI-07" data-tone="success"><div class="stat-value" id="s-chatgpt">-</div><div class="stat-label">ChatGPT</div></div>
+    <div class="stat-card" data-code="WEB-08" data-tone="success"><div class="stat-value" id="s-google">-</div><div class="stat-label">Google</div></div>
+    <div class="stat-card" data-code="HOME-09" data-tone="violet"><div class="stat-value" id="s-residential">-</div><div class="stat-label">住宅 IP</div></div>
+    <div class="stat-card" data-code="USR-10"><div class="stat-value" id="s-users">-</div><div class="stat-label">注册用户</div></div>
+    <div class="stat-card" data-code="DUP-11" data-tone="warn"><div class="stat-value" id="s-duplicates">-</div><div class="stat-label">源内重复出口</div></div>
+    <div class="stat-card" data-code="EIP-12" data-tone="success"><div class="stat-value" id="s-unique-exits">-</div><div class="stat-label">源内唯一出口</div></div>
   </div>
 
   <!-- Type breakdown -->
@@ -207,7 +247,7 @@ tr:hover td { background:rgba(108,99,255,.03); }
     </div>
     <div class="card">
       <table>
-        <thead><tr><th>名称</th><th>类型</th><th>URL</th><th>代理数</th><th>自动更新(分)</th><th>更新时间</th><th>创建时间</th><th>操作</th></tr></thead>
+        <thead><tr><th>名称</th><th>类型</th><th>URL</th><th>节点 / 重复</th><th>订阅重合关系</th><th>自动更新(分)</th><th>更新时间</th><th>创建时间</th><th>操作</th></tr></thead>
         <tbody id="sub-table"></tbody>
       </table>
       <div class="empty" id="sub-empty">暂无订阅源</div>
@@ -374,6 +414,16 @@ async function loadStats() {
   document.getElementById('s-chatgpt').textContent = d.chatgpt_accessible??0;
   document.getElementById('s-google').textContent = d.google_accessible??0;
   document.getElementById('s-residential').textContent = d.residential??0;
+  // listSubscriptions fills these from its richer per-source telemetry. Only
+  // overwrite them when the aggregate stats endpoint actually exposes the
+  // matching fields; both requests run concurrently during refresh().
+  const aggregateDuplicateCount = d.duplicate_exit_proxies ?? d.duplicate_proxies;
+  if (aggregateDuplicateCount != null) {
+    document.getElementById('s-duplicates').textContent = aggregateDuplicateCount;
+  }
+  if (d.unique_exit_ips != null) {
+    document.getElementById('s-unique-exits').textContent = d.unique_exit_ips;
+  }
   const tc = document.getElementById('type-chips');
   if(d.by_type) {
     tc.innerHTML = Object.entries(d.by_type).map(([k,v])=>`<span class="type-chip">${esc(k)}: ${v}</span>`).join('');
@@ -443,8 +493,27 @@ async function loadSubscriptions() {
     : '跟随全局默认值';
   const tb = document.getElementById('sub-table');
   const empty = document.getElementById('sub-empty');
-  if(!d.subscriptions||!d.subscriptions.length) { tb.innerHTML=''; empty.style.display=''; return; }
+  if(!d.subscriptions||!d.subscriptions.length) {
+    tb.innerHTML='';
+    empty.style.display='';
+    document.getElementById('s-duplicates').textContent = '0';
+    document.getElementById('s-unique-exits').textContent = '0';
+    return;
+  }
   empty.style.display='none';
+  const byId = Object.fromEntries(d.subscriptions.map(s => [String(s.id), s]));
+  const overlapById = {};
+  for (const edge of (d.overlap_edges || [])) {
+    const left = String(edge.left_subscription_id || '');
+    const right = String(edge.right_subscription_id || '');
+    if (!left || !right) continue;
+    (overlapById[left] ||= []).push({ id: right, shared_exact_nodes: edge.shared_exact_nodes, shared_endpoints: edge.shared_endpoints, shared_exit_ips: edge.shared_exit_ips });
+    (overlapById[right] ||= []).push({ id: left, shared_exact_nodes: edge.shared_exact_nodes, shared_endpoints: edge.shared_endpoints, shared_exit_ips: edge.shared_exit_ips });
+  }
+  const duplicateExitTotal = d.subscriptions.reduce((sum, s) => sum + Number(s.duplicate_stats?.duplicate_exit_ip_nodes || 0), 0);
+  const uniqueExitTotal = d.subscriptions.reduce((sum, s) => sum + Number(s.duplicate_stats?.unique_exit_ips || 0), 0);
+  document.getElementById('s-duplicates').textContent = duplicateExitTotal;
+  document.getElementById('s-unique-exits').textContent = uniqueExitTotal;
   tb.innerHTML = d.subscriptions.map(s => {
     const effectiveInterval = s.refresh_interval_mins == null ? defaultSubRefreshInterval : s.refresh_interval_mins;
     const refreshCell = s.url
@@ -453,11 +522,35 @@ async function loadSubscriptions() {
           <button class="btn btn-sm" onclick="saveSubRefresh('${s.id}')">保存</button>
         </div>${s.refresh_interval_mins == null ? '<div style="margin-top:4px;color:var(--text-dim);font-size:12px">当前跟随全局默认值</div>' : ''}`
       : '<span style="color:var(--text-dim)">仅 URL 可定时更新</span>';
+    const importDuplicateCount = Number(s.duplicate_proxy_count ?? 0);
+    const duplicateStats = s.duplicate_stats || {};
+    const exitDuplicateCount = Number(duplicateStats.duplicate_exit_ip_nodes || 0);
+    const uniqueCount = duplicateStats.unique_exit_ips;
+    const rawOverlaps = overlapById[String(s.id)] || s.overlaps || s.overlap_subscriptions || [];
+    const overlapItems = (Array.isArray(rawOverlaps) ? rawOverlaps : []).map(item => {
+      if (typeof item === 'string') {
+        return { name: byId[item]?.name || item, exact: 0, exits: 0, endpoints: 0 };
+      }
+      const id = String(item.subscription_id ?? item.id ?? '');
+      return {
+        name: item.name || byId[id]?.name || id || '未知订阅',
+        exact: Number(item.shared_exact_nodes || 0),
+        exits: Number(item.shared_exit_ips || 0),
+        endpoints: Number(item.shared_endpoints || item.shared_count || item.count || 0)
+      };
+    }).sort((a, b) => b.exact - a.exact || b.exits - a.exits || b.endpoints - a.endpoints || a.name.localeCompare(b.name, 'zh-CN'));
+    const overlapCell = overlapItems.length
+      ? `<div class="overlap-list">${overlapItems.map(o => `<span class="overlap-chip" title="完整配置完全相同 ${o.exact}，共享入口 ${o.endpoints}，共享出口 IP ${o.exits}">${esc(o.name)} · 完全重复 ${o.exact} / 入口 ${o.endpoints} / 出口 ${o.exits}</span>`).join('')}</div>`
+      : '<span style="color:var(--text-dim)">无跨订阅重复</span>';
+    const inventoryCell = `<div class="metric-pair"><strong>${s.proxy_count ?? 0}</strong><small>/ 原始 ${s.raw_proxy_count ?? s.proxy_count ?? 0}</small></div>
+      <div style="margin-top:4px;color:${importDuplicateCount ? 'var(--warn)' : 'var(--text-dim)'};font-size:10px" title="订阅内容中完全相同、导入时直接丢弃且不会进入验活的节点">导入重复 ${importDuplicateCount}（未验活）</div>
+      <div style="margin-top:3px;color:${exitDuplicateCount ? 'var(--warn)' : 'var(--text-dim)'};font-size:10px">出口重复 ${exitDuplicateCount}${uniqueCount == null ? '' : ` · 唯一出口 ${uniqueCount}`}</div>`;
     return `<tr>
       <td>${esc(s.name)}</td>
       <td><span class="badge badge-type">${esc(s.sub_type)}</span></td>
       <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc(s.url||'(内容)')}</td>
-      <td>${s.proxy_count}</td>
+      <td>${inventoryCell}</td>
+      <td>${overlapCell}</td>
       <td>${refreshCell}</td>
       <td>${fmtDate(s.last_refresh_at || s.updated_at)}</td>
       <td>${fmtDate(s.created_at)}</td>
@@ -718,6 +811,15 @@ async function cleanupUselessProxies() {
 function refresh() { loadStats(); loadUsers(); loadSubscriptions(); loadProxies(); }
 
 // Init: check auth
+function updateCommandTime() {
+  const el = document.getElementById('command-time');
+  if (el) el.textContent = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', hour12: false, year: 'numeric', month: '2-digit',
+    day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'
+  }).format(new Date());
+}
+updateCommandTime();
+setInterval(updateCommandTime, 1000);
 checkAuth();
 </script>
 </body>

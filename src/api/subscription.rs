@@ -51,13 +51,38 @@ pub async fn list_subscriptions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let subs = state.db.get_subscriptions()?;
-    let default_refresh_interval_mins = state
-        .db
-        .get_subscription_default_refresh_interval_mins(
-            state.config.subscription.auto_refresh_interval_mins,
-        )?;
+    let (duplicate_stats, overlap_edges) = state.db.get_subscription_duplicate_overview()?;
+    let stats_by_subscription: std::collections::HashMap<_, _> = duplicate_stats
+        .into_iter()
+        .map(|stats| (stats.subscription_id.clone(), stats))
+        .collect();
+    let subscriptions: Vec<_> = subs
+        .into_iter()
+        .map(|sub| {
+            let duplicate_stats = stats_by_subscription.get(&sub.id);
+            json!({
+                "id": sub.id,
+                "name": sub.name,
+                "sub_type": sub.sub_type,
+                "url": sub.url,
+                "content": sub.content,
+                "proxy_count": sub.proxy_count,
+                "raw_proxy_count": sub.raw_proxy_count,
+                "duplicate_proxy_count": sub.duplicate_proxy_count,
+                "refresh_interval_mins": sub.refresh_interval_mins,
+                "last_refresh_at": sub.last_refresh_at,
+                "created_at": sub.created_at,
+                "updated_at": sub.updated_at,
+                "duplicate_stats": duplicate_stats,
+            })
+        })
+        .collect();
+    let default_refresh_interval_mins = state.db.get_subscription_default_refresh_interval_mins(
+        state.config.subscription.auto_refresh_interval_mins,
+    )?;
     Ok(Json(json!({
-        "subscriptions": subs,
+        "subscriptions": subscriptions,
+        "overlap_edges": overlap_edges,
         "default_refresh_interval_mins": default_refresh_interval_mins,
     })))
 }
@@ -111,6 +136,9 @@ pub async fn add_subscription(
             "No proxies found in subscription content".into(),
         ));
     }
+    let raw_proxy_count = parsed.len();
+    let parsed = deduplicate_parsed_proxies(parsed);
+    let duplicate_proxy_count = raw_proxy_count.saturating_sub(parsed.len());
 
     let now = chrono::Utc::now().to_rfc3339();
     let sub_id = uuid::Uuid::new_v4().to_string();
@@ -120,8 +148,14 @@ pub async fn add_subscription(
         name: req.name.clone(),
         sub_type: req.sub_type.clone(),
         url: req.url.clone(),
-        content: if req.url.is_some() { None } else { Some(content) },
+        content: if req.url.is_some() {
+            None
+        } else {
+            Some(content)
+        },
         proxy_count: parsed.len() as i32,
+        raw_proxy_count: raw_proxy_count as i32,
+        duplicate_proxy_count: duplicate_proxy_count as i32,
         refresh_interval_mins,
         last_refresh_at: Some(now.clone()),
         created_at: now.clone(),
@@ -154,12 +188,21 @@ pub async fn add_subscription(
     }
 
     state.db.insert_proxies_batch(&proxy_rows)?;
+    state.db.inherit_exact_duplicate_states(
+        &proxy_rows
+            .iter()
+            .map(|proxy| proxy.id.clone())
+            .collect::<Vec<_>>(),
+    )?;
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     crate::api::fetch::invalidate_stats_cache(state.as_ref());
 
     let added = proxy_rows.len();
 
-    tracing::info!("Added subscription '{}' with {added} proxies", req.name);
+    tracing::info!(
+        "Added subscription '{}' with {added} proxies (discarded {duplicate_proxy_count} exact duplicates)",
+        req.name
+    );
 
     // Assign ports then validate in background (must be sequential, not two separate spawns)
     let state2 = state.clone();
@@ -173,6 +216,7 @@ pub async fn add_subscription(
     Ok(Json(json!({
         "subscription": subscription,
         "proxies_added": added,
+        "duplicates_discarded": duplicate_proxy_count,
     })))
 }
 
@@ -272,7 +316,10 @@ pub async fn update_subscription_defaults(
 /// 4. Only then handle old proxies that no longer appear in the new list:
 ///    - explicit Invalid: delete immediately
 ///    - Valid/Untested: keep as orphaned for fallback or delayed cleanup
-pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription) -> Result<usize, String> {
+pub async fn refresh_subscription_core(
+    state: &Arc<AppState>,
+    sub: &Subscription,
+) -> Result<usize, String> {
     let content = if let Some(ref url) = sub.url {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -297,26 +344,62 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
     if parsed.is_empty() {
         return Err("Parsed 0 proxies, keeping existing data".into());
     }
+    let raw_proxy_count = parsed.len();
+    let parsed = deduplicate_parsed_proxies(parsed);
+    let duplicate_proxy_count = raw_proxy_count.saturating_sub(parsed.len());
 
-    // Collect old proxies for this subscription, keyed by (server, port, proxy_type)
+    // Keep every old definition for an endpoint. A source may legitimately
+    // contain multiple credentials/transports behind the same server:port, so
+    // a single-value map would silently discard all but one during refresh.
     let old_proxies = state
         .db
         .get_proxies_by_subscription(&sub.id)
         .map_err(|e| format!("Failed to load old proxies: {e}"))?;
-    let mut old_map: std::collections::HashMap<(String, u16, String), ProxyRow> = old_proxies
-        .into_iter()
-        .map(|p| ((p.server.clone(), p.port as u16, p.proxy_type.clone()), p))
+    let mut old_map: std::collections::HashMap<(String, u16, String), Vec<ProxyRow>> =
+        std::collections::HashMap::new();
+    for proxy in old_proxies {
+        old_map
+            .entry((
+                proxy.server.to_ascii_lowercase(),
+                proxy.port as u16,
+                proxy.proxy_type.clone(),
+            ))
+            .or_default()
+            .push(proxy);
+    }
+
+    // Match all unchanged definitions before reusing an old endpoint for a
+    // changed definition. This makes matching independent of source order and
+    // preserves validation/quality data for every unchanged credential.
+    let exact_old_matches: Vec<Option<ProxyRow>> = parsed
+        .iter()
+        .map(|pc| {
+            let key = (
+                pc.server.to_ascii_lowercase(),
+                pc.port,
+                pc.proxy_type.to_string(),
+            );
+            old_map
+                .get_mut(&key)
+                .and_then(|candidates| take_matching_proxy(candidates, &pc.singbox_outbound))
+        })
         .collect();
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut total = 0;
     let mut kept_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut new_proxy_rows = Vec::new();
+    let mut state_inheritance_ids = Vec::new();
 
-    for pc in &parsed {
-        let key = (pc.server.clone(), pc.port, pc.proxy_type.to_string());
+    for (pc, exact_old) in parsed.iter().zip(exact_old_matches) {
+        let key = (
+            pc.server.to_ascii_lowercase(),
+            pc.port,
+            pc.proxy_type.to_string(),
+        );
 
-        if let Some(old) = old_map.remove(&key) {
+        let old = exact_old.or_else(|| old_map.get_mut(&key).and_then(take_preferred_proxy));
+        if let Some(old) = old {
             // Same endpoint still exists. Preserve health only when the full
             // outbound is unchanged; credentials/transport changes require a
             // fresh validation and fresh quality metadata.
@@ -324,7 +407,9 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
 
             let new_config = serde_json::to_string(&pc.singbox_outbound).unwrap_or_default();
             let old_value = serde_json::from_str::<serde_json::Value>(&old.config_json).ok();
-            let config_changed = old_value.as_ref() != Some(&pc.singbox_outbound);
+            let config_changed = old_value.as_ref().map_or(true, |old| {
+                !outbound_definitions_equal(old, &pc.singbox_outbound)
+            });
             if config_changed {
                 crate::bindings::cleanup_proxy_binding(
                     state,
@@ -338,16 +423,15 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
                     .db
                     .reset_proxy_after_config_change(&old.id, &pc.name, &new_config)
                     .map_err(|e| format!("Failed to reset changed proxy config: {e}"))?;
+                state_inheritance_ids.push(old.id.clone());
             } else {
                 state
                     .db
                     .update_proxy_config(&old.id, &pc.name, &new_config)
                     .map_err(|e| format!("Failed to update proxy config: {e}"))?;
-                state.pool.update_proxy_config(
-                    &old.id,
-                    &pc.name,
-                    pc.singbox_outbound.clone(),
-                );
+                state
+                    .pool
+                    .update_proxy_config(&old.id, &pc.name, pc.singbox_outbound.clone());
             }
 
             total += 1;
@@ -371,6 +455,7 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
                 updated_at: now.clone(),
                 orphaned_at: None,
             });
+            state_inheritance_ids.push(proxy_id);
             total += 1;
         }
     }
@@ -379,6 +464,10 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
         .db
         .insert_proxies_batch(&new_proxy_rows)
         .map_err(|e| format!("Failed to insert proxies: {e}"))?;
+    state
+        .db
+        .inherit_exact_duplicate_states(&state_inheritance_ids)
+        .map_err(|e| format!("Failed to inherit exact-duplicate state: {e}"))?;
 
     // Handle old proxies that no longer appear in the new list:
     // - explicit invalid: delete immediately
@@ -387,7 +476,7 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
     let mut removed_invalid = 0usize;
     let mut orphaned_valid = 0usize;
     let mut orphaned_untested = 0usize;
-    for old in old_map.values() {
+    for old in old_map.values().flatten() {
         if old.is_valid {
             state.db.mark_proxy_orphaned(&old.id, &now).ok();
             orphaned_valid += 1;
@@ -410,7 +499,12 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
 
     state
         .db
-        .mark_subscription_refreshed(&sub.id, total as i32)
+        .mark_subscription_refreshed(
+            &sub.id,
+            total as i32,
+            raw_proxy_count as i32,
+            duplicate_proxy_count as i32,
+        )
         .map_err(|e| format!("Failed to update proxy count: {e}"))?;
     crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
     crate::api::fetch::invalidate_stats_cache(state.as_ref());
@@ -428,6 +522,129 @@ pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription
     }
 
     Ok(total)
+}
+
+/// Drop equivalent proxy definitions before inserting or validating them.
+/// Display names and sing-box tags are ignored; credentials and route settings
+/// remain part of the identity.
+fn deduplicate_parsed_proxies(proxies: Vec<parser::ProxyConfig>) -> Vec<parser::ProxyConfig> {
+    let mut seen = std::collections::HashSet::with_capacity(proxies.len());
+    proxies
+        .into_iter()
+        .filter(|proxy| seen.insert(proxy_definition_key(proxy)))
+        .collect()
+}
+
+fn take_matching_proxy(
+    candidates: &mut Vec<ProxyRow>,
+    outbound: &serde_json::Value,
+) -> Option<ProxyRow> {
+    let index = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            serde_json::from_str::<serde_json::Value>(&candidate.config_json)
+                .is_ok_and(|old| outbound_definitions_equal(&old, outbound))
+        })
+        .min_by_key(|(_, candidate)| candidate.orphaned_at.is_some())
+        .map(|(index, _)| index)?;
+    Some(candidates.swap_remove(index))
+}
+
+fn take_preferred_proxy(candidates: &mut Vec<ProxyRow>) -> Option<ProxyRow> {
+    let index = candidates
+        .iter()
+        .position(|candidate| candidate.orphaned_at.is_none())
+        .or_else(|| candidates.len().checked_sub(1))?;
+    Some(candidates.swap_remove(index))
+}
+
+fn proxy_definition_key(proxy: &parser::ProxyConfig) -> String {
+    outbound_definition_key(
+        &proxy.proxy_type.to_string(),
+        &proxy.server,
+        proxy.port,
+        &proxy.singbox_outbound,
+    )
+}
+
+/// Stable identity for a connectable proxy definition. Display-only tags and
+/// DNS-name casing do not make two otherwise identical nodes distinct.
+pub(crate) fn outbound_definition_key(
+    proxy_type: &str,
+    server: &str,
+    port: u16,
+    outbound: &serde_json::Value,
+) -> String {
+    let mut outbound = outbound.clone();
+    normalize_definition_fields(&mut outbound);
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        proxy_type.to_ascii_lowercase(),
+        server.to_ascii_lowercase(),
+        port,
+        canonical_json(&outbound)
+    )
+}
+
+pub(crate) fn proxy_row_definition_key(proxy: &ProxyRow) -> String {
+    serde_json::from_str::<serde_json::Value>(&proxy.config_json)
+        .map(|outbound| {
+            outbound_definition_key(
+                &proxy.proxy_type,
+                &proxy.server,
+                proxy.port as u16,
+                &outbound,
+            )
+        })
+        // A malformed stored definition must never collapse unrelated rows.
+        .unwrap_or_else(|_| format!("invalid\u{1f}{}", proxy.id))
+}
+
+fn outbound_definitions_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    normalize_definition_fields(&mut left);
+    normalize_definition_fields(&mut right);
+    left == right
+}
+
+fn normalize_definition_fields(outbound: &mut serde_json::Value) {
+    if let Some(object) = outbound.as_object_mut() {
+        object.remove("tag");
+        if let Some(serde_json::Value::String(server)) = object.get_mut("server") {
+            *server = server.to_ascii_lowercase();
+        }
+    }
+}
+
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut keys: Vec<_> = object.keys().collect();
+            keys.sort_unstable();
+            let fields = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap_or_default(),
+                        canonical_json(&object[key])
+                    )
+                })
+                .collect::<Vec<_>>();
+            format!("{{{}}}", fields.join(","))
+        }
+        serde_json::Value::Array(array) => format!(
+            "[{}]",
+            array
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        _ => value.to_string(),
+    }
 }
 
 pub async fn refresh_subscription(
@@ -482,10 +699,18 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
 
     let mut selected = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
+    // Map every complete proxy definition to its single binding representative.
+    // Validation may later select an equivalent row owned by another source;
+    // in that case the already selected representative does the probe and its
+    // result is propagated to every source row.
+    let mut definition_representatives = std::collections::HashMap::new();
     let mut work_ids = Vec::new();
 
     for (row, quality) in state.db.get_hot_proxy_records(prebound).unwrap_or_default() {
-        if seen_ids.insert(row.id.clone()) {
+        let definition = proxy_row_definition_key(&row);
+        if !definition_representatives.contains_key(&definition) && seen_ids.insert(row.id.clone())
+        {
+            definition_representatives.insert(definition, row.id.clone());
             selected.push(crate::pool::manager::ProxyPool::from_db_parts(row, quality));
         }
     }
@@ -499,14 +724,11 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
             cfg.valid_recheck_hours > 0,
         );
         let now = chrono::Utc::now();
-        let valid_before = (now
-            - chrono::Duration::hours(cfg.valid_recheck_hours.max(1) as i64))
-        .to_rfc3339();
+        let valid_before =
+            (now - chrono::Duration::hours(cfg.valid_recheck_hours.max(1) as i64)).to_rfc3339();
         let retry_before = (now - chrono::Duration::minutes(180)).to_rfc3339();
         let orphaned_before = (now
-            - chrono::Duration::hours(
-                state.config.subscription.orphaned_valid_grace_hours as i64,
-            ))
+            - chrono::Duration::hours(state.config.subscription.orphaned_valid_grace_hours as i64))
         .to_rfc3339();
         for (row, quality) in state
             .db
@@ -521,17 +743,25 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
             )
             .unwrap_or_default()
         {
-            work_ids.push(row.id.clone());
-            if seen_ids.insert(row.id.clone()) {
+            let definition = proxy_row_definition_key(&row);
+            if let Some(representative_id) = definition_representatives.get(&definition) {
+                // Validate the one already-bound representative. A successful
+                // round synchronizes every exact source copy, so this legacy
+                // mismatch cannot keep reappearing in later rounds.
+                if !work_ids.contains(representative_id) {
+                    work_ids.push(representative_id.clone());
+                }
+            } else if seen_ids.insert(row.id.clone()) {
+                definition_representatives.insert(definition, row.id.clone());
+                work_ids.push(row.id.clone());
                 selected.push(crate::pool::manager::ProxyPool::from_db_parts(row, quality));
             }
         }
     }
     let quality_stale_hours = state.config.quality.stale_hours.max(1);
     if matches!(mode, SyncMode::QualityCheck) {
-        let stale_before = (chrono::Utc::now()
-            - chrono::Duration::hours(quality_stale_hours as i64))
-        .to_rfc3339();
+        let stale_before =
+            (chrono::Utc::now() - chrono::Duration::hours(quality_stale_hours as i64)).to_rfc3339();
         for (row, quality) in state
             .db
             .get_due_quality_proxy_records(
@@ -541,7 +771,19 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
             )
             .unwrap_or_default()
         {
-            if seen_ids.insert(row.id.clone()) {
+            let definition = proxy_row_definition_key(&row);
+            if definition_representatives.contains_key(&definition) {
+                // Old databases may contain exact copies whose quality rows
+                // predate shared-result propagation. Reuse the freshest known
+                // copy rather than allocating another sing-box binding.
+                if let Err(error) = state
+                    .db
+                    .inherit_exact_duplicate_states(std::slice::from_ref(&row.id))
+                {
+                    tracing::warn!("Failed to inherit exact-duplicate quality state: {error}");
+                }
+            } else if seen_ids.insert(row.id.clone()) {
+                definition_representatives.insert(definition, row.id.clone());
                 selected.push(crate::pool::manager::ProxyPool::from_db_parts(row, quality));
             }
         }
@@ -549,7 +791,11 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) -> SyncB
 
     let mut managed_ids = std::collections::HashSet::new();
     let now = chrono::Utc::now();
-    for proxy in selected.iter().filter(|p| p.status == ProxyStatus::Valid).take(prebound) {
+    for proxy in selected
+        .iter()
+        .filter(|p| p.status == ProxyStatus::Valid)
+        .take(prebound)
+    {
         managed_ids.insert(proxy.id.clone());
     }
     match mode {
@@ -667,7 +913,11 @@ pub(crate) fn validation_batch_limits(
         return (0, 0, 0);
     }
     let new_percent = new_percent as usize;
-    let valid_percent = if valid_enabled { valid_percent as usize } else { 0 };
+    let valid_percent = if valid_enabled {
+        valid_percent as usize
+    } else {
+        0
+    };
     let invalid_percent = invalid_percent as usize;
     let total = new_percent + valid_percent + invalid_percent;
     if total == 0 {
@@ -706,5 +956,105 @@ fn validate_refresh_interval_mins(value: Option<i32>) -> Result<Option<i32>, App
             "refresh_interval_mins must be >= 0".into(),
         )),
         other => Ok(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{deduplicate_parsed_proxies, proxy_row_definition_key, take_matching_proxy};
+    use crate::db::ProxyRow;
+    use crate::parser::{ProxyConfig, ProxyType};
+    use serde_json::json;
+
+    fn proxy(name: &str, tag: &str, password: &str) -> ProxyConfig {
+        ProxyConfig {
+            name: name.into(),
+            proxy_type: ProxyType::Trojan,
+            server: "EXAMPLE.com".into(),
+            port: 443,
+            singbox_outbound: json!({
+                "type": "trojan",
+                "tag": tag,
+                "server": "example.com",
+                "server_port": 443,
+                "password": password,
+                "tls": {"enabled": true}
+            }),
+        }
+    }
+
+    #[test]
+    fn exact_source_duplicates_are_removed_before_validation() {
+        let proxies = vec![
+            proxy("first name", "generated-1", "same-secret"),
+            proxy("other name", "generated-2", "same-secret"),
+            proxy("different credential", "generated-3", "other-secret"),
+        ];
+
+        let deduplicated = deduplicate_parsed_proxies(proxies);
+        assert_eq!(deduplicated.len(), 2);
+        assert_eq!(deduplicated[0].name, "first name");
+        assert_eq!(deduplicated[1].name, "different credential");
+    }
+
+    #[test]
+    fn refresh_match_keeps_distinct_credentials_on_the_same_endpoint() {
+        let mut candidates = vec![
+            proxy_row("old-a", "secret-a"),
+            proxy_row("old-b", "secret-b"),
+        ];
+        let wanted = proxy("new-b", "generated", "secret-b").singbox_outbound;
+
+        let matched = take_matching_proxy(&mut candidates, &wanted).unwrap();
+
+        assert_eq!(matched.id, "old-b");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "old-a");
+    }
+
+    #[test]
+    fn cross_subscription_identity_ignores_only_display_tag_and_server_case() {
+        let mut first = proxy_row("source-a", "same-secret");
+        first.subscription_id = "subscription-a".into();
+        first.server = "EXAMPLE.COM".into();
+
+        let mut second = proxy_row("source-b", "same-secret");
+        second.subscription_id = "subscription-b".into();
+        second.name = "another display name".into();
+        let mut second_config: serde_json::Value =
+            serde_json::from_str(&second.config_json).unwrap();
+        second_config["tag"] = json!("different-generated-tag");
+        second.config_json = second_config.to_string();
+
+        let different_credential = proxy_row("source-c", "other-secret");
+
+        assert_eq!(
+            proxy_row_definition_key(&first),
+            proxy_row_definition_key(&second)
+        );
+        assert_ne!(
+            proxy_row_definition_key(&first),
+            proxy_row_definition_key(&different_credential)
+        );
+    }
+
+    fn proxy_row(id: &str, password: &str) -> ProxyRow {
+        ProxyRow {
+            id: id.into(),
+            subscription_id: "subscription".into(),
+            name: id.into(),
+            proxy_type: "trojan".into(),
+            server: "example.com".into(),
+            port: 443,
+            config_json: proxy(id, id, password).singbox_outbound.to_string(),
+            is_valid: true,
+            local_port: None,
+            error_count: 0,
+            last_error: None,
+            last_validated: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            orphaned_at: None,
+        }
     }
 }

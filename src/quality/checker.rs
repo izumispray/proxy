@@ -68,15 +68,10 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
     // Hold lock only for short binding-selection work.
     let to_check = {
         let _lock = state.validation_lock.lock().await;
-        let stale_before =
-            (now - chrono::Duration::hours(stale_hours as i64)).to_rfc3339();
+        let stale_before = (now - chrono::Duration::hours(stale_hours as i64)).to_rfc3339();
         let due = state
             .db
-            .get_due_quality_proxy_records(
-                max_checks,
-                &stale_before,
-                MAX_INCOMPLETE_RETRIES,
-            )
+            .get_due_quality_proxy_records(max_checks, &stale_before, MAX_INCOMPLETE_RETRIES)
             .map_err(|e| format!("Failed to load quality-check candidates: {e}"))?;
 
         if due.is_empty() {
@@ -108,7 +103,9 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
         );
         total_checked += check_batch(&to_check, &state, &rate_limiter).await;
     } else {
-        tracing::info!("Quality check: due proxies exist but none received active bindings this round");
+        tracing::info!(
+            "Quality check: due proxies exist but none received active bindings this round"
+        );
     }
 
     let _lock = state.validation_lock.lock().await;
@@ -120,6 +117,7 @@ pub async fn check_all(state: Arc<AppState>) -> Result<usize, String> {
 
     if total_checked > 0 {
         crate::api::fetch::invalidate_stats_cache(state.as_ref());
+        crate::api::sub_export::invalidate_subscription_export_cache(state.as_ref());
         tracing::info!("Quality check complete: {total_checked} proxies checked in this run");
     }
 
@@ -198,12 +196,20 @@ async fn check_batch(
                         extra_json: Some(extra.to_string()),
                         checked_at: chrono::Utc::now().to_rfc3339(),
                     };
-                    if let Err(error) = state.db.upsert_quality(&db_quality) {
-                        tracing::warn!("Failed to save quality for {}: {error}", proxy.name);
-                        return false;
-                    }
+                    let duplicate_ids = match state
+                        .db
+                        .upsert_exact_duplicate_quality(&proxy.id, &db_quality)
+                    {
+                        Ok(ids) => ids,
+                        Err(error) => {
+                            tracing::warn!("Failed to save quality for {}: {error}", proxy.name);
+                            return false;
+                        }
+                    };
                     quality.incomplete_retry_count = incomplete_retry_count;
-                    state.pool.set_quality(&proxy.id, quality);
+                    for id in duplicate_ids {
+                        state.pool.set_quality(&id, quality.clone());
+                    }
                     true
                 }
                 Err(e) => {
@@ -268,7 +274,10 @@ pub(crate) fn quality_checked_at_is_stale(
 }
 
 fn quality_is_incomplete(q: &ProxyQualityInfo) -> bool {
-    q.country.is_none() || q.ip_type.is_none() || q.ip_address.is_none() || q.risk_level == "Unknown"
+    q.country.is_none()
+        || q.ip_type.is_none()
+        || q.ip_address.is_none()
+        || q.risk_level == "Unknown"
 }
 
 /// IP info from ip-api.com (primary source — free, no key, auto-detects caller IP)
@@ -320,15 +329,15 @@ struct QualityCheckResult {
 
 async fn check_single(
     proxy_addr: &str,
-    _proxy: &PoolProxy,
+    proxy: &PoolProxy,
     rate_limiter: &RateLimiter,
 ) -> Result<QualityCheckResult, String> {
-    let proxy = reqwest::Proxy::all(proxy_addr).map_err(|e| e.to_string())?;
+    let reqwest_proxy = reqwest::Proxy::all(proxy_addr).map_err(|e| e.to_string())?;
     // no_proxy() must come BEFORE .proxy() — it clears all proxies and disables
     // env var detection; the subsequent .proxy() then adds our explicit proxy back.
     let client = reqwest::Client::builder()
         .no_proxy()
-        .proxy(proxy)
+        .proxy(reqwest_proxy)
         .timeout(std::time::Duration::from_secs(30))
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -347,11 +356,30 @@ async fn check_single(
     let ipinfo_ok = ipinfo_result.is_some();
 
     // Merge IP info: prefer ipinfo.io for org detail, fall back to ip-api.com for IP/country
+    let validation_ip = proxy
+        .quality
+        .as_ref()
+        .and_then(|quality| quality.ip_address.clone());
     let (ip_address, country, ip_type, mut is_residential) = match ipinfo_result {
-        Some((ip, country, ip_type, residential)) => (ip, country, ip_type, residential),
+        Some((ip, country, ip_type, residential)) => (
+            ip.or_else(|| ipapi_result.as_ref().and_then(|result| result.ip.clone()))
+                .or(validation_ip),
+            country.or_else(|| {
+                ipapi_result
+                    .as_ref()
+                    .and_then(|result| result.country.clone())
+            }),
+            ip_type,
+            residential,
+        ),
         None => {
-            // ipinfo.io failed — use ip-api.com as fallback
-            let ip = ipapi_result.as_ref().and_then(|r| r.ip.clone());
+            // Preserve the exit address captured during validation if both
+            // enrichment services are temporarily unavailable. Public fetch
+            // and Clash export require a measured IP for deduplication.
+            let ip = ipapi_result
+                .as_ref()
+                .and_then(|r| r.ip.clone())
+                .or(validation_ip);
             let country = ipapi_result.as_ref().and_then(|r| r.country.clone());
             (ip, country, None, false)
         }
@@ -422,13 +450,20 @@ async fn query_ip_api(client: &reqwest::Client) -> Option<IpApiResult> {
         }
         let resp = match client.get(url).send().await {
             Ok(r) if r.status().as_u16() == 429 => {
-                tracing::warn!("ip-api.com rate limited (attempt {}), backing off", attempt + 1);
+                tracing::warn!(
+                    "ip-api.com rate limited (attempt {}), backing off",
+                    attempt + 1
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 continue;
             }
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                tracing::warn!("ip-api.com returned status {} (attempt {})", r.status(), attempt + 1);
+                tracing::warn!(
+                    "ip-api.com returned status {} (attempt {})",
+                    r.status(),
+                    attempt + 1
+                );
                 continue;
             }
             Err(e) => {
@@ -472,7 +507,11 @@ async fn query_ipinfo(
         let resp = match client.get("https://ipinfo.io/json").send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                tracing::warn!("ipinfo.io returned status {} (attempt {})", r.status(), attempt + 1);
+                tracing::warn!(
+                    "ipinfo.io returned status {} (attempt {})",
+                    r.status(),
+                    attempt + 1
+                );
                 continue;
             }
             Err(e) => {
@@ -571,7 +610,10 @@ async fn check_chatgpt(client: &reqwest::Client) -> EndpointCheck {
                         EndpointCheck::ok(Some(code), format!("http {code}"))
                     }
                 }
-                Err(e) => EndpointCheck::ok(Some(code), format!("body read failed: {}", shorten_detail(e.to_string()))),
+                Err(e) => EndpointCheck::ok(
+                    Some(code),
+                    format!("body read failed: {}", shorten_detail(e.to_string())),
+                ),
             }
         }
         Err(e) => EndpointCheck::fail(None, shorten_detail(e.to_string())),

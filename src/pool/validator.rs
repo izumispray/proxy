@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+const EXIT_IP_URL: &str = "https://www.cloudflare.com/cdn-cgi/trace";
+const EXIT_IP_FALLBACK_URL: &str = "https://api.ipify.org";
+
 struct RunningGuard<'a> {
     flag: &'a AtomicBool,
 }
@@ -176,7 +179,10 @@ async fn drop_proxy_after_binding_failure(
     let failures = match state.db.record_proxy_binding_failure(&proxy.id) {
         Ok(failures) => failures,
         Err(error) => {
-            tracing::warn!("Failed to record binding failure for {}: {error}", proxy.name);
+            tracing::warn!(
+                "Failed to record binding failure for {}: {error}",
+                proxy.name
+            );
             return;
         }
     };
@@ -228,28 +234,92 @@ async fn validate_batch(
 
             let proxy_addr = format!("http://127.0.0.1:{local_port}");
             let result =
-                validate_with_fallback(&proxy_addr, &url, fallback_url.as_deref(), timeout).await;
+                match validate_with_fallback(&proxy_addr, &url, fallback_url.as_deref(), timeout)
+                    .await
+                {
+                    Ok(()) => detect_exit_ip(&proxy_addr, timeout).await,
+                    Err(error) => Err(error),
+                };
 
             match result {
-                Ok(()) => {
-                    state.pool.set_status(&proxy_id, ProxyStatus::Valid);
-                    state
-                        .db
-                        .update_proxy_validation(&proxy_id, true, None)
-                        .ok();
+                Ok(exit_ip) => {
+                    let duplicate_ids = match state.db.update_exact_duplicate_validation(
+                        &proxy_id,
+                        true,
+                        None,
+                        Some(&exit_ip),
+                    ) {
+                        Ok(ids) => ids,
+                        Err(error) => {
+                            tracing::warn!(
+                                "Proxy {proxy_name} passed validation but duplicate state could not be saved: {error}"
+                            );
+                            state.pool.set_status(&proxy_id, ProxyStatus::Invalid);
+                            state
+                                .db
+                                .update_proxy_validation(
+                                    &proxy_id,
+                                    false,
+                                    Some("Failed to persist detected exit IP"),
+                                )
+                                .ok();
+                            return;
+                        }
+                    };
+                    let quality = state
+                        .pool
+                        .get(&proxy_id)
+                        .and_then(|p| p.quality)
+                        .map(|mut quality| {
+                            quality.ip_address = Some(exit_ip.clone());
+                            quality
+                        })
+                        .unwrap_or(crate::pool::manager::ProxyQualityInfo {
+                            ip_address: Some(exit_ip),
+                            country: None,
+                            ip_type: None,
+                            is_residential: false,
+                            chatgpt_accessible: false,
+                            google_accessible: false,
+                            risk_score: 1.0,
+                            risk_level: "Unknown".to_string(),
+                            checked_at: None,
+                            incomplete_retry_count: 0,
+                        });
+                    for id in duplicate_ids {
+                        state.pool.set_status(&id, ProxyStatus::Valid);
+                        state.pool.set_quality(&id, quality.clone());
+                    }
                 }
                 Err(e) => {
                     tracing::debug!("Proxy {proxy_name} failed validation: {e}");
-                    state.pool.set_status(&proxy_id, ProxyStatus::Invalid);
-                    state
+                    let duplicate_ids = state
                         .db
-                        .update_proxy_validation(&proxy_id, false, Some(&e))
-                        .ok();
-                    if state.db.delete_proxy_if_orphaned(&proxy_id).unwrap_or(false) {
+                        .update_exact_duplicate_validation(&proxy_id, false, Some(&e), None)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!("Failed to sync duplicate validation state: {error}");
+                            vec![proxy_id.clone()]
+                        });
+                    for id in &duplicate_ids {
+                        state.pool.set_status(id, ProxyStatus::Invalid);
+                    }
+                    let orphaned_ids: Vec<_> = duplicate_ids
+                        .iter()
+                        .filter_map(|id| {
+                            state
+                                .db
+                                .delete_proxy_if_orphaned(id)
+                                .unwrap_or(false)
+                                .then(|| id.clone())
+                        })
+                        .collect();
+                    if orphaned_ids.iter().any(|id| id == &proxy_id) {
                         crate::bindings::cleanup_proxy_binding(&state, &proxy_id, Some(local_port))
                             .await;
-                        state.binding_usage.remove(&proxy_id);
-                        state.pool.remove(&proxy_id);
+                    }
+                    for id in orphaned_ids {
+                        state.binding_usage.remove(&id);
+                        state.pool.remove(&id);
                     }
                 }
             }
@@ -264,6 +334,61 @@ async fn validate_batch(
         }
     }
     count
+}
+
+async fn detect_exit_ip(proxy_addr: &str, timeout: std::time::Duration) -> Result<String, String> {
+    let proxy = reqwest::Proxy::all(proxy_addr).map_err(|e| format!("Proxy config error: {e}"))?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(proxy)
+        .timeout(timeout)
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(|e| format!("Client build error: {e}"))?;
+    match request_exit_ip(&client, EXIT_IP_URL, true).await {
+        Ok(ip) => Ok(ip),
+        Err(primary_error) => request_exit_ip(&client, EXIT_IP_FALLBACK_URL, false)
+            .await
+            .map_err(|fallback_error| {
+                format!(
+                    "Exit IP detection failed: primary ({primary_error}); fallback ({fallback_error})"
+                )
+            }),
+    }
+}
+
+async fn request_exit_ip(
+    client: &reqwest::Client,
+    url: &str,
+    cloudflare_trace: bool,
+) -> Result<String, String> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("response read failed: {e}"))?;
+    parse_exit_ip_response(&body, cloudflare_trace)
+}
+
+fn parse_exit_ip_response(body: &str, cloudflare_trace: bool) -> Result<String, String> {
+    let value = if cloudflare_trace {
+        body.lines()
+            .find_map(|line| line.strip_prefix("ip="))
+            .ok_or_else(|| "Cloudflare trace response has no ip field".to_string())?
+    } else {
+        body.trim()
+    };
+    value
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.to_string())
+        .map_err(|_| "service returned an invalid address".to_string())
 }
 
 async fn validate_single(
@@ -305,21 +430,20 @@ async fn validate_with_fallback(
         fallback_url.filter(|url| !url.is_empty() && *url != primary_url),
     ) {
         (Ok(()), _) => Ok(()),
-        (Err(primary_error), Some(fallback)) => {
-            validate_single(proxy_addr, fallback, timeout)
-                .await
-                .map_err(|fallback_error| {
-                    format!(
-                        "primary probe failed ({primary_error}); fallback failed ({fallback_error})"
-                    )
-                })
-        }
+        (Err(primary_error), Some(fallback)) => validate_single(proxy_addr, fallback, timeout)
+            .await
+            .map_err(|fallback_error| {
+                format!(
+                    "primary probe failed ({primary_error}); fallback failed ({fallback_error})"
+                )
+            }),
         (Err(error), None) => Err(error),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::parse_exit_ip_response;
     use crate::api::subscription::validation_batch_limits;
 
     #[test]
@@ -335,5 +459,18 @@ mod tests {
             (210, 60, 30)
         );
         assert_eq!(validation_batch_limits(3, 70, 20, 10, true), (1, 1, 1));
+    }
+
+    #[test]
+    fn exit_ip_parser_accepts_cloudflare_trace_and_plain_fallback() {
+        assert_eq!(
+            parse_exit_ip_response("fl=1\nip=203.0.113.8\nloc=US\n", true).unwrap(),
+            "203.0.113.8"
+        );
+        assert_eq!(
+            parse_exit_ip_response("2001:db8::1\n", false).unwrap(),
+            "2001:db8::1"
+        );
+        assert!(parse_exit_ip_response("loc=US\n", true).is_err());
     }
 }

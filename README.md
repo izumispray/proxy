@@ -378,7 +378,7 @@ GET /api/proxies?api_key=xxx
 订阅链接只返回已验活且仍属于当前订阅源的代理，并使用独立的 `subscription.password` 鉴权。该密码只用于订阅下载 URL，不能访问管理接口。也可通过 `ZENPROXY_SUBSCRIPTION_PASSWORD` 设置；旧配置未设置时暂时回退到 `server.admin_password`，升级后建议立即补上独立密码。
 
 ```
-https://proxy.mui.moe/sub/{subscription_password}/all
+https://proxy.mui.moe/sub/{subscription_password}/all/clash.yaml
 https://proxy.mui.moe/sub/{subscription_password}/vless/clash.yaml
 https://proxy.mui.moe/sub/{subscription_password}/vmess/clash.yaml
 https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
@@ -417,6 +417,8 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 
 验证通过配置的主、备用 URL 检测代理是否可用；两个地址都只接受精确的 HTTP 204，并正常校验 TLS 证书。主地址失败后才尝试备用地址。
 
+对外获取、Relay/监听器自动选点以及 Clash 订阅都按质检得到的出口 IP 去重；同一出口 IP 只保留错误更少、最近验活成功的一条线路。尚未获得出口 IP 的节点留在内部库存继续质检，但不会提前出现在对外结果中。ChatGPT、Google、住宅和质检统计也按唯一出口 IP 计数。
+
 **触发时机：**
 - 导入/刷新订阅后**立即触发**
 - 定时任务：每 `validation.interval_mins` 分钟运行一次
@@ -448,7 +450,7 @@ https://proxy.mui.moe/sub/{subscription_password}/trojan/clash.yaml
 
 #### 质量检测（Quality Check）
 
-通过 ip-api.com 和 ipinfo.io 获取代理的 IP 信息、地理位置、风险评估。
+验活通过后会自动探测并保存出口 IP；通过 ip-api.com 和 ipinfo.io 进一步获取地理位置、风险评估。公共代理接口和 Clash 订阅会按出口 IP 自动去重，同一出口只返回状态最佳的一条节点，无需手动维护。
 
 **检测内容：**
 | 项目 | 来源 | 说明 |

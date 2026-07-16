@@ -1,6 +1,6 @@
+use base64::Engine;
 use postgres::types::ToSql;
 use postgres::{Client, Config, NoTls, Row};
-use base64::Engine;
 use std::sync::Mutex;
 
 pub struct Database {
@@ -18,6 +18,11 @@ pub struct Subscription {
     pub url: Option<String>,
     pub content: Option<String>,
     pub proxy_count: i32,
+    /// Number of parsable proxy records in the latest source payload, before
+    /// exact-node deduplication.
+    pub raw_proxy_count: i32,
+    /// Exact duplicate records discarded before they can enter validation.
+    pub duplicate_proxy_count: i32,
     pub refresh_interval_mins: Option<i32>,
     pub last_refresh_at: Option<String>,
     pub created_at: String,
@@ -46,7 +51,8 @@ impl Subscription {
         default_refresh_interval_mins: u64,
         now: &chrono::DateTime<chrono::Utc>,
     ) -> bool {
-        let Some(interval_mins) = self.effective_refresh_interval_mins(default_refresh_interval_mins)
+        let Some(interval_mins) =
+            self.effective_refresh_interval_mins(default_refresh_interval_mins)
         else {
             return false;
         };
@@ -127,6 +133,9 @@ pub struct Session {
 pub struct ProxyListQuery {
     pub page: usize,
     pub page_size: usize,
+    /// Collapse rows with a measured exit IP to one canonical proxy. Admin
+    /// inventory views leave this disabled so duplicate sources remain visible.
+    pub unique_exit_ip: bool,
     pub cursor: Option<String>,
     pub direction: Option<String>,
     pub search: Option<String>,
@@ -164,6 +173,27 @@ pub struct ProxyListPage {
     pub has_next: bool,
     pub has_previous: bool,
     pub counts_available: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubscriptionDuplicateStats {
+    pub subscription_id: String,
+    pub stored_nodes: i64,
+    pub valid_nodes: i64,
+    pub unique_endpoints: i64,
+    pub duplicate_endpoint_nodes: i64,
+    pub measured_exit_nodes: i64,
+    pub unique_exit_ips: i64,
+    pub duplicate_exit_ip_nodes: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubscriptionOverlap {
+    pub left_subscription_id: String,
+    pub right_subscription_id: String,
+    pub shared_exact_nodes: i64,
+    pub shared_endpoints: i64,
+    pub shared_exit_ips: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -207,6 +237,8 @@ impl Database {
                     url TEXT,
                     content TEXT,
                     proxy_count INTEGER NOT NULL DEFAULT 0,
+                    raw_proxy_count INTEGER NOT NULL DEFAULT 0,
+                    duplicate_proxy_count INTEGER NOT NULL DEFAULT 0,
                     refresh_interval_mins INTEGER,
                     last_refresh_at TEXT,
                     created_at TEXT NOT NULL,
@@ -242,6 +274,8 @@ impl Database {
                 ALTER TABLE proxies ADD COLUMN IF NOT EXISTS last_binding_failure TEXT;
                 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS refresh_interval_mins INTEGER;
                 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS last_refresh_at TEXT;
+                ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS raw_proxy_count INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS duplicate_proxy_count INTEGER NOT NULL DEFAULT 0;
 
                 CREATE TABLE IF NOT EXISTS proxy_quality (
                     proxy_id TEXT PRIMARY KEY,
@@ -282,6 +316,9 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
                 CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);
                 CREATE INDEX IF NOT EXISTS idx_proxies_subscription_id ON proxies(subscription_id);
+                CREATE INDEX IF NOT EXISTS idx_proxies_endpoint_subscription
+                    ON proxies ((LOWER(server)), port, proxy_type, subscription_id)
+                    WHERE orphaned_at IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_proxies_is_valid ON proxies(is_valid);
                 CREATE INDEX IF NOT EXISTS idx_proxies_last_validated ON proxies(last_validated);
                 CREATE INDEX IF NOT EXISTS idx_proxies_error_count ON proxies(error_count);
@@ -305,6 +342,9 @@ impl Database {
                     ON proxies(last_binding_failure)
                     WHERE binding_failure_count > 0;
                 CREATE INDEX IF NOT EXISTS idx_proxy_quality_country ON proxy_quality(country);
+                CREATE INDEX IF NOT EXISTS idx_proxy_quality_ip_address
+                    ON proxy_quality(ip_address)
+                    WHERE ip_address IS NOT NULL AND BTRIM(ip_address) <> '';
                 CREATE INDEX IF NOT EXISTS idx_proxy_quality_chatgpt ON proxy_quality(chatgpt_accessible);
                 CREATE INDEX IF NOT EXISTS idx_proxy_quality_google ON proxy_quality(google_accessible);
                 CREATE INDEX IF NOT EXISTS idx_proxy_quality_residential ON proxy_quality(is_residential);
@@ -319,10 +359,11 @@ impl Database {
             conn.execute(
                 "INSERT INTO subscriptions (
                     id, name, sub_type, url, content, proxy_count,
+                    raw_proxy_count, duplicate_proxy_count,
                     refresh_interval_mins, last_refresh_at, created_at, updated_at
                  ) VALUES (
-                    $1, $2, $3, $4, $5, $6,
-                    $7, $8, $9, $10
+                    $1, $2, $3, $4, $5, $6, $7, $8,
+                    $9, $10, $11, $12
                  )",
                 &[
                     &sub.id,
@@ -331,6 +372,8 @@ impl Database {
                     &sub.url,
                     &sub.content,
                     &sub.proxy_count,
+                    &sub.raw_proxy_count,
+                    &sub.duplicate_proxy_count,
                     &sub.refresh_interval_mins,
                     &sub.last_refresh_at,
                     &sub.created_at,
@@ -345,6 +388,7 @@ impl Database {
         self.with_conn(|conn| {
             let rows = conn.query(
                 "SELECT id, name, sub_type, url, content, proxy_count,
+                        raw_proxy_count, duplicate_proxy_count,
                         refresh_interval_mins, last_refresh_at, created_at, updated_at
                  FROM subscriptions ORDER BY created_at DESC",
                 &[],
@@ -357,6 +401,7 @@ impl Database {
         self.with_conn(|conn| {
             let row = conn.query_opt(
                 "SELECT id, name, sub_type, url, content, proxy_count,
+                        raw_proxy_count, duplicate_proxy_count,
                         refresh_interval_mins, last_refresh_at, created_at, updated_at
                  FROM subscriptions WHERE id = $1",
                 &[&id],
@@ -442,14 +487,17 @@ impl Database {
         &self,
         sub_id: &str,
         count: i32,
+        raw_count: i32,
+        duplicate_count: i32,
     ) -> Result<(), postgres::Error> {
         let now = chrono::Utc::now().to_rfc3339();
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE subscriptions
-                 SET proxy_count = $1, last_refresh_at = $2, updated_at = $2
-                 WHERE id = $3",
-                &[&count, &now, &sub_id],
+                 SET proxy_count = $1, raw_proxy_count = $2,
+                     duplicate_proxy_count = $3, last_refresh_at = $4, updated_at = $4
+                 WHERE id = $5",
+                &[&count, &raw_count, &duplicate_count, &now, &sub_id],
             )?;
             Ok(())
         })
@@ -575,6 +623,179 @@ impl Database {
         })
     }
 
+    /// Per-source duplicate data and pairwise source overlap. Only current
+    /// inventory participates; orphaned fallback rows intentionally do not.
+    pub fn get_subscription_duplicate_overview(
+        &self,
+    ) -> Result<(Vec<SubscriptionDuplicateStats>, Vec<SubscriptionOverlap>), postgres::Error> {
+        self.with_conn(|conn| {
+            let stat_rows = conn.query(
+                "SELECT
+                    s.id AS subscription_id,
+                    COUNT(p.id) AS stored_nodes,
+                    COUNT(p.id) FILTER (WHERE p.is_valid = TRUE) AS valid_nodes,
+                    COUNT(DISTINCT (LOWER(p.server), p.port, p.proxy_type)) AS unique_endpoints,
+                    GREATEST(
+                        COUNT(p.id) - COUNT(DISTINCT (LOWER(p.server), p.port, p.proxy_type)),
+                        0
+                    ) AS duplicate_endpoint_nodes,
+                    COUNT(q.ip_address) FILTER (
+                        WHERE q.ip_address IS NOT NULL AND BTRIM(q.ip_address) <> ''
+                    ) AS measured_exit_nodes,
+                    COUNT(DISTINCT q.ip_address) FILTER (
+                        WHERE q.ip_address IS NOT NULL AND BTRIM(q.ip_address) <> ''
+                    ) AS unique_exit_ips
+                 FROM subscriptions s
+                 LEFT JOIN proxies p
+                   ON p.subscription_id = s.id AND p.orphaned_at IS NULL
+                 LEFT JOIN proxy_quality q ON q.proxy_id = p.id
+                 GROUP BY s.id",
+                &[],
+            )?;
+            let stats = stat_rows
+                .iter()
+                .map(|row| {
+                    let measured_exit_nodes: i64 = row.get("measured_exit_nodes");
+                    let unique_exit_ips: i64 = row.get("unique_exit_ips");
+                    SubscriptionDuplicateStats {
+                        subscription_id: row.get("subscription_id"),
+                        stored_nodes: row.get("stored_nodes"),
+                        valid_nodes: row.get("valid_nodes"),
+                        unique_endpoints: row.get("unique_endpoints"),
+                        duplicate_endpoint_nodes: row.get("duplicate_endpoint_nodes"),
+                        measured_exit_nodes,
+                        unique_exit_ips,
+                        duplicate_exit_ip_nodes: (measured_exit_nodes - unique_exit_ips).max(0),
+                    }
+                })
+                .collect();
+
+            let exact_rows = conn.query(
+                "SELECT id, subscription_id, name, proxy_type, server, port, config_json,
+                        is_valid, local_port, error_count, last_error, last_validated,
+                        created_at, updated_at, orphaned_at
+                 FROM proxies WHERE orphaned_at IS NULL",
+                &[],
+            )?;
+            let mut exact_sources: std::collections::HashMap<
+                String,
+                std::collections::HashSet<String>,
+            > = std::collections::HashMap::new();
+            for row in &exact_rows {
+                let proxy = proxy_from_row(row);
+                exact_sources
+                    .entry(crate::api::subscription::proxy_row_definition_key(&proxy))
+                    .or_default()
+                    .insert(proxy.subscription_id);
+            }
+            let mut exact_overlaps: std::collections::HashMap<(String, String), i64> =
+                std::collections::HashMap::new();
+            for sources in exact_sources.values() {
+                let mut sources: Vec<_> = sources.iter().cloned().collect();
+                sources.sort_unstable();
+                for left_index in 0..sources.len() {
+                    for right_index in (left_index + 1)..sources.len() {
+                        *exact_overlaps
+                            .entry((sources[left_index].clone(), sources[right_index].clone()))
+                            .or_default() += 1;
+                    }
+                }
+            }
+
+            let overlap_rows = conn.query(
+                "WITH endpoint_sources AS (
+                    SELECT DISTINCT subscription_id, LOWER(server) AS server, port, proxy_type
+                    FROM proxies
+                    WHERE orphaned_at IS NULL
+                 ), endpoint_overlap AS (
+                    SELECT a.subscription_id AS left_id, b.subscription_id AS right_id,
+                           COUNT(*) AS shared_endpoints
+                    FROM endpoint_sources a
+                    JOIN endpoint_sources b
+                      ON a.server = b.server AND a.port = b.port
+                     AND a.proxy_type = b.proxy_type
+                     AND a.subscription_id < b.subscription_id
+                    GROUP BY a.subscription_id, b.subscription_id
+                 ), exit_sources AS (
+                    SELECT DISTINCT p.subscription_id, q.ip_address
+                    FROM proxies p
+                    JOIN proxy_quality q ON q.proxy_id = p.id
+                    WHERE p.orphaned_at IS NULL
+                      AND q.ip_address IS NOT NULL AND BTRIM(q.ip_address) <> ''
+                 ), exit_overlap AS (
+                    SELECT a.subscription_id AS left_id, b.subscription_id AS right_id,
+                           COUNT(*) AS shared_exit_ips
+                    FROM exit_sources a
+                    JOIN exit_sources b
+                      ON a.ip_address = b.ip_address
+                     AND a.subscription_id < b.subscription_id
+                    GROUP BY a.subscription_id, b.subscription_id
+                 )
+                 SELECT COALESCE(e.left_id, x.left_id) AS left_id,
+                        COALESCE(e.right_id, x.right_id) AS right_id,
+                        COALESCE(e.shared_endpoints, 0) AS shared_endpoints,
+                        COALESCE(x.shared_exit_ips, 0) AS shared_exit_ips
+                 FROM endpoint_overlap e
+                 FULL OUTER JOIN exit_overlap x
+                   ON x.left_id = e.left_id AND x.right_id = e.right_id
+                 ORDER BY (COALESCE(e.shared_endpoints, 0) + COALESCE(x.shared_exit_ips, 0)) DESC,
+                          left_id, right_id",
+                &[],
+            )?;
+            let overlaps = overlap_rows
+                .iter()
+                .map(|row| {
+                    let left_subscription_id: String = row.get("left_id");
+                    let right_subscription_id: String = row.get("right_id");
+                    SubscriptionOverlap {
+                        shared_exact_nodes: exact_overlaps
+                            .get(&(left_subscription_id.clone(), right_subscription_id.clone()))
+                            .copied()
+                            .unwrap_or(0),
+                        left_subscription_id,
+                        right_subscription_id,
+                        shared_endpoints: row.get("shared_endpoints"),
+                        shared_exit_ips: row.get("shared_exit_ips"),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut overlaps_by_pair: std::collections::HashMap<_, _> = overlaps
+                .into_iter()
+                .map(|overlap| {
+                    (
+                        (
+                            overlap.left_subscription_id.clone(),
+                            overlap.right_subscription_id.clone(),
+                        ),
+                        overlap,
+                    )
+                })
+                .collect();
+            for ((left_subscription_id, right_subscription_id), shared_exact_nodes) in
+                exact_overlaps
+            {
+                overlaps_by_pair
+                    .entry((left_subscription_id.clone(), right_subscription_id.clone()))
+                    .or_insert(SubscriptionOverlap {
+                        left_subscription_id,
+                        right_subscription_id,
+                        shared_exact_nodes,
+                        shared_endpoints: 0,
+                        shared_exit_ips: 0,
+                    });
+            }
+            let mut overlaps: Vec<_> = overlaps_by_pair.into_values().collect();
+            overlaps.sort_by(|left, right| {
+                (right.shared_exact_nodes + right.shared_endpoints + right.shared_exit_ips)
+                    .cmp(&(left.shared_exact_nodes + left.shared_endpoints + left.shared_exit_ips))
+                    .then_with(|| left.left_subscription_id.cmp(&right.left_subscription_id))
+                    .then_with(|| left.right_subscription_id.cmp(&right.right_subscription_id))
+            });
+
+            Ok((stats, overlaps))
+        })
+    }
+
     pub fn get_valid_export_proxies(
         &self,
         proxy_type: Option<&str>,
@@ -585,11 +806,23 @@ impl Database {
                     "SELECT id, subscription_id, name, proxy_type, server, port, config_json,
                             is_valid, local_port, error_count, last_error, last_validated,
                             created_at, updated_at, orphaned_at
-                     FROM proxies
-                     WHERE is_valid = TRUE
-                       AND orphaned_at IS NULL
-                       AND proxy_type = $1
-                     ORDER BY error_count ASC, last_validated DESC NULLS LAST, updated_at DESC, name ASC",
+                     FROM (
+                        SELECT DISTINCT ON (q.ip_address)
+                            p.id, p.subscription_id, p.name, p.proxy_type, p.server, p.port,
+                            p.config_json, p.is_valid, p.local_port, p.error_count, p.last_error,
+                            p.last_validated, p.created_at, p.updated_at, p.orphaned_at
+                        FROM proxies p
+                        JOIN proxy_quality q ON q.proxy_id = p.id
+                        WHERE p.is_valid = TRUE
+                          AND p.orphaned_at IS NULL
+                          AND p.proxy_type = $1
+                          AND q.ip_address IS NOT NULL
+                          AND BTRIM(q.ip_address) <> ''
+                        ORDER BY q.ip_address, p.error_count ASC,
+                                 p.last_validated DESC NULLS LAST, p.updated_at DESC, p.id ASC
+                     ) deduplicated
+                     ORDER BY error_count ASC, last_validated DESC NULLS LAST,
+                              updated_at DESC, name ASC",
                     &[&proxy_type],
                 )?
             } else {
@@ -597,10 +830,22 @@ impl Database {
                     "SELECT id, subscription_id, name, proxy_type, server, port, config_json,
                             is_valid, local_port, error_count, last_error, last_validated,
                             created_at, updated_at, orphaned_at
-                     FROM proxies
-                     WHERE is_valid = TRUE
-                       AND orphaned_at IS NULL
-                     ORDER BY proxy_type ASC, error_count ASC, last_validated DESC NULLS LAST, updated_at DESC, name ASC",
+                     FROM (
+                        SELECT DISTINCT ON (q.ip_address)
+                            p.id, p.subscription_id, p.name, p.proxy_type, p.server, p.port,
+                            p.config_json, p.is_valid, p.local_port, p.error_count, p.last_error,
+                            p.last_validated, p.created_at, p.updated_at, p.orphaned_at
+                        FROM proxies p
+                        JOIN proxy_quality q ON q.proxy_id = p.id
+                        WHERE p.is_valid = TRUE
+                          AND p.orphaned_at IS NULL
+                          AND q.ip_address IS NOT NULL
+                          AND BTRIM(q.ip_address) <> ''
+                        ORDER BY q.ip_address, p.error_count ASC,
+                                 p.last_validated DESC NULLS LAST, p.updated_at DESC, p.id ASC
+                     ) deduplicated
+                     ORDER BY proxy_type ASC, error_count ASC,
+                              last_validated DESC NULLS LAST, updated_at DESC, name ASC",
                     &[],
                 )?
             };
@@ -638,16 +883,30 @@ impl Database {
         self.with_conn(|conn| {
             let rows = conn.query(
                 "SELECT
-                    p.id, p.subscription_id, p.name, p.proxy_type, p.server, p.port, p.config_json,
-                    p.is_valid, p.local_port, p.error_count, p.last_error, p.last_validated,
-                    p.created_at, p.updated_at, p.orphaned_at,
-                    q.proxy_id, q.ip_address, q.country, q.ip_type, q.is_residential,
-                    q.chatgpt_accessible, q.google_accessible, q.risk_score, q.risk_level,
-                    q.extra_json, q.checked_at
-                 FROM proxies p
-                 LEFT JOIN proxy_quality q ON q.proxy_id = p.id
-                 WHERE p.is_valid = TRUE
-                 ORDER BY p.orphaned_at ASC NULLS FIRST, p.error_count ASC, p.last_validated DESC NULLS LAST, p.updated_at DESC
+                    id, subscription_id, name, proxy_type, server, port, config_json,
+                    is_valid, local_port, error_count, last_error, last_validated,
+                    created_at, updated_at, orphaned_at,
+                    proxy_id, ip_address, country, ip_type, is_residential,
+                    chatgpt_accessible, google_accessible, risk_score, risk_level,
+                    extra_json, checked_at
+                 FROM (
+                    SELECT DISTINCT ON (q.ip_address)
+                        p.id, p.subscription_id, p.name, p.proxy_type, p.server, p.port,
+                        p.config_json, p.is_valid, p.local_port, p.error_count, p.last_error,
+                        p.last_validated, p.created_at, p.updated_at, p.orphaned_at,
+                        q.proxy_id, q.ip_address, q.country, q.ip_type, q.is_residential,
+                        q.chatgpt_accessible, q.google_accessible, q.risk_score, q.risk_level,
+                        q.extra_json, q.checked_at
+                    FROM proxies p
+                    JOIN proxy_quality q ON q.proxy_id = p.id
+                    WHERE p.is_valid = TRUE
+                      AND p.orphaned_at IS NULL
+                      AND q.ip_address IS NOT NULL
+                      AND BTRIM(q.ip_address) <> ''
+                    ORDER BY q.ip_address, p.error_count ASC,
+                             p.last_validated DESC NULLS LAST, p.updated_at DESC, p.id ASC
+                 ) deduplicated
+                 ORDER BY error_count ASC, last_validated DESC NULLS LAST, updated_at DESC
                  LIMIT $1",
                 &[&limit],
             )?;
@@ -664,8 +923,7 @@ impl Database {
         let limit = limit.max(1) as i64;
         let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
         let where_clause = build_fetch_proxy_where(filter, &mut params, true);
-        let order_by_clause =
-            build_random_valid_proxy_order_by(&mut params, recent_error_before);
+        let order_by_clause = build_random_valid_proxy_order_by(&mut params, recent_error_before);
         params.push(Box::new(limit));
         let limit_idx = params.len();
 
@@ -677,12 +935,23 @@ impl Database {
                     p.id, p.subscription_id, p.name, p.proxy_type, p.server, p.port, p.config_json,
                     p.is_valid, p.local_port, p.error_count, p.last_error, p.last_validated,
                     p.created_at, p.updated_at, p.orphaned_at,
-                    q.proxy_id, q.ip_address, q.country, q.ip_type, q.is_residential,
-                    q.chatgpt_accessible, q.google_accessible, q.risk_score, q.risk_level,
-                    q.extra_json, q.checked_at
-                 FROM proxies p
-                 LEFT JOIN proxy_quality q ON q.proxy_id = p.id
-                 {where_clause}
+                    p.proxy_id, p.ip_address, p.country, p.ip_type, p.is_residential,
+                    p.chatgpt_accessible, p.google_accessible, p.risk_score, p.risk_level,
+                    p.extra_json, p.checked_at
+                 FROM (
+                    SELECT DISTINCT ON (q.ip_address)
+                        p.id, p.subscription_id, p.name, p.proxy_type, p.server, p.port,
+                        p.config_json, p.is_valid, p.local_port, p.error_count, p.last_error,
+                        p.last_validated, p.created_at, p.updated_at, p.orphaned_at,
+                        q.proxy_id, q.ip_address, q.country, q.ip_type, q.is_residential,
+                        q.chatgpt_accessible, q.google_accessible, q.risk_score, q.risk_level,
+                        q.extra_json, q.checked_at
+                    FROM proxies p
+                    JOIN proxy_quality q ON q.proxy_id = p.id
+                    {where_clause}
+                    ORDER BY q.ip_address, p.error_count ASC,
+                             p.last_validated DESC NULLS LAST, p.updated_at DESC, p.id ASC
+                 ) p
                  ORDER BY {order_by_clause}
                  LIMIT ${limit_idx}"
             );
@@ -792,7 +1061,8 @@ impl Database {
         orphaned_before: &str,
         error_threshold: u32,
     ) -> Result<Vec<(ProxyRow, Option<ProxyQuality>)>, postgres::Error> {
-        let columns = "p.id, p.subscription_id, p.name, p.proxy_type, p.server, p.port, p.config_json,
+        let columns =
+            "p.id, p.subscription_id, p.name, p.proxy_type, p.server, p.port, p.config_json,
                        p.is_valid, p.local_port, p.error_count, p.last_error, p.last_validated,
                        p.created_at, p.updated_at, p.orphaned_at,
                        q.proxy_id, q.ip_address, q.country, q.ip_type, q.is_residential,
@@ -852,8 +1122,8 @@ impl Database {
                         &sql,
                         &[&valid_before, &orphaned_before, &retry_before, &valid_limit],
                     )?
-                        .iter()
-                        .map(proxy_record_from_join_row),
+                    .iter()
+                    .map(proxy_record_from_join_row),
                 );
             }
 
@@ -872,12 +1142,9 @@ impl Database {
                      LIMIT $3"
                 );
                 records.extend(
-                    conn.query(
-                        &sql,
-                        &[&error_threshold, &retry_before, &invalid_limit],
-                    )?
-                    .iter()
-                    .map(proxy_record_from_join_row),
+                    conn.query(&sql, &[&error_threshold, &retry_before, &invalid_limit])?
+                        .iter()
+                        .map(proxy_record_from_join_row),
                 );
             }
 
@@ -958,10 +1225,7 @@ impl Database {
         })
     }
 
-    pub fn delete_orphaned_non_valid_before(
-        &self,
-        cutoff: &str,
-    ) -> Result<usize, postgres::Error> {
+    pub fn delete_orphaned_non_valid_before(&self, cutoff: &str) -> Result<usize, postgres::Error> {
         self.with_conn(|conn| {
             conn.execute(
                 "DELETE FROM proxy_quality WHERE proxy_id IN (
@@ -1102,39 +1366,49 @@ impl Database {
         // A filter change or deletion can make the requested page disappear.
         // Return the last available page instead of a misleading empty result.
         let page = requested_page.min(total_pages.max(1));
-        let offset = (page - 1)
-            .saturating_mul(page_size)
-            .min(i64::MAX as usize) as i64;
+        let offset = (page - 1).saturating_mul(page_size).min(i64::MAX as usize) as i64;
 
         let mut select_params = count_params;
         let cursor_clause = cursor
             .as_ref()
-            .map(|cursor| build_proxy_cursor_clause(
-                cursor,
-                sort_expr,
-                sort_key,
-                dir,
-                backwards,
-                &mut select_params,
-            ))
+            .map(|cursor| {
+                build_proxy_cursor_clause(
+                    cursor,
+                    sort_expr,
+                    sort_key,
+                    dir,
+                    backwards,
+                    &mut select_params,
+                )
+            })
             .unwrap_or_default();
         // Ask for one extra row so has_next/has_previous does not need another query.
         select_params.push(Box::new((page_size + 1) as i64));
         let limit_idx = select_params.len();
         let query_dir = if backwards {
-            if dir == "ASC" { "DESC" } else { "ASC" }
+            if dir == "ASC" {
+                "DESC"
+            } else {
+                "ASC"
+            }
         } else {
             dir
         };
-        let id_dir = if backwards { "DESC" } else { "ASC" };
+        let id_dir = if (dir == "ASC") ^ backwards {
+            "ASC"
+        } else {
+            "DESC"
+        };
         // OFFSET remains only for legacy callers that do not send a cursor.
         let legacy_offset = if cursor.is_none() { offset } else { 0 };
         select_params.push(Box::new(legacy_offset));
         let offset_idx = select_params.len();
 
         self.with_conn(|conn| {
-            let param_refs: Vec<&(dyn ToSql + Sync)> =
-                select_params.iter().map(|p| &**p as &(dyn ToSql + Sync)).collect();
+            let param_refs: Vec<&(dyn ToSql + Sync)> = select_params
+                .iter()
+                .map(|p| &**p as &(dyn ToSql + Sync))
+                .collect();
             let sql = format!(
                 "SELECT
                     p.id, p.subscription_id, p.name, p.proxy_type, p.server, p.port, p.local_port,
@@ -1168,8 +1442,16 @@ impl Database {
             };
             let next_cursor = cursor_rows.last().and_then(cursor_for);
             let prev_cursor = cursor_rows.first().and_then(cursor_for);
-            let has_next = if backwards { cursor.is_some() } else { has_extra };
-            let has_previous = if backwards { has_extra } else { cursor.is_some() };
+            let has_next = if backwards {
+                cursor.is_some()
+            } else {
+                has_extra
+            };
+            let has_previous = if backwards {
+                has_extra
+            } else {
+                cursor.is_some()
+            };
             Ok(ProxyListPage {
                 proxies,
                 total,
@@ -1251,25 +1533,230 @@ impl Database {
         })
     }
 
-    pub fn mark_proxy_relay_failed(
+    /// Return every inventory row that describes the same connectable node as
+    /// `source_id`. Subscription ownership and display tags are deliberately
+    /// ignored, while credentials, TLS and transport settings remain part of
+    /// the identity.
+    pub fn get_exact_duplicate_proxy_ids(
         &self,
-        id: &str,
-        error: &str,
+        source_id: &str,
+    ) -> Result<Vec<String>, postgres::Error> {
+        self.with_conn(|conn| {
+            let Some(source_row) = conn.query_opt(
+                "SELECT id, subscription_id, name, proxy_type, server, port, config_json,
+                        is_valid, local_port, error_count, last_error, last_validated,
+                        created_at, updated_at, orphaned_at
+                 FROM proxies WHERE id = $1",
+                &[&source_id],
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let source = proxy_from_row(&source_row);
+            let source_key = crate::api::subscription::proxy_row_definition_key(&source);
+            let rows = conn.query(
+                "SELECT id, subscription_id, name, proxy_type, server, port, config_json,
+                        is_valid, local_port, error_count, last_error, last_validated,
+                        created_at, updated_at, orphaned_at
+                 FROM proxies
+                 WHERE LOWER(server) = LOWER($1) AND port = $2 AND LOWER(proxy_type) = LOWER($3)",
+                &[&source.server, &source.port, &source.proxy_type],
+            )?;
+            Ok(rows
+                .iter()
+                .map(proxy_from_row)
+                .filter(|proxy| {
+                    crate::api::subscription::proxy_row_definition_key(proxy) == source_key
+                })
+                .map(|proxy| proxy.id)
+                .collect())
+        })
+    }
+
+    /// Reuse already-known health and quality for newly inserted exact
+    /// duplicates. The source rows remain in the inventory so subscription
+    /// provenance is preserved, but no duplicate network probe is needed.
+    pub fn inherit_exact_duplicate_states(
+        &self,
+        target_ids: &[String],
     ) -> Result<(), postgres::Error> {
+        for target_id in target_ids {
+            let duplicate_ids = self.get_exact_duplicate_proxy_ids(target_id)?;
+            let donor = duplicate_ids
+                .iter()
+                .filter(|id| *id != target_id)
+                .filter_map(|id| self.get_proxy_record(id).ok().flatten())
+                .filter(|(proxy, _)| proxy.last_validated.is_some())
+                .max_by(|(left, _), (right, _)| left.last_validated.cmp(&right.last_validated));
+            let Some((donor, donor_quality)) = donor else {
+                continue;
+            };
+
+            self.with_conn(|conn| {
+                let mut tx = conn.transaction()?;
+                tx.execute(
+                    "UPDATE proxies
+                     SET is_valid = $1, error_count = $2, last_error = $3,
+                         last_validated = $4, local_port = NULL, updated_at = $5
+                     WHERE id = $6",
+                    &[
+                        &donor.is_valid,
+                        &donor.error_count,
+                        &donor.last_error,
+                        &donor.last_validated,
+                        &donor.updated_at,
+                        &target_id,
+                    ],
+                )?;
+                if let Some(quality) = donor_quality {
+                    tx.execute(
+                        "INSERT INTO proxy_quality (
+                            proxy_id, ip_address, country, ip_type, is_residential,
+                            chatgpt_accessible, google_accessible, risk_score, risk_level,
+                            extra_json, checked_at
+                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                         ON CONFLICT (proxy_id) DO UPDATE SET
+                            ip_address = EXCLUDED.ip_address,
+                            country = EXCLUDED.country,
+                            ip_type = EXCLUDED.ip_type,
+                            is_residential = EXCLUDED.is_residential,
+                            chatgpt_accessible = EXCLUDED.chatgpt_accessible,
+                            google_accessible = EXCLUDED.google_accessible,
+                            risk_score = EXCLUDED.risk_score,
+                            risk_level = EXCLUDED.risk_level,
+                            extra_json = EXCLUDED.extra_json,
+                            checked_at = EXCLUDED.checked_at",
+                        &[
+                            &target_id,
+                            &quality.ip_address,
+                            &quality.country,
+                            &quality.ip_type,
+                            &quality.is_residential,
+                            &quality.chatgpt_accessible,
+                            &quality.google_accessible,
+                            &quality.risk_score,
+                            &quality.risk_level,
+                            &quality.extra_json,
+                            &quality.checked_at,
+                        ],
+                    )?;
+                }
+                tx.commit()
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Persist one validation result for all exact copies and return their IDs
+    /// so the in-memory hot pool can be kept consistent with the database.
+    pub fn update_exact_duplicate_validation(
+        &self,
+        source_id: &str,
+        is_valid: bool,
+        error: Option<&str>,
+        exit_ip: Option<&str>,
+    ) -> Result<Vec<String>, postgres::Error> {
+        let ids = self.get_exact_duplicate_proxy_ids(source_id)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let err = error.to_string();
+        let err = error.map(str::to_string);
+        self.with_conn(|conn| {
+            let mut tx = conn.transaction()?;
+            for id in &ids {
+                if is_valid {
+                    tx.execute(
+                        "UPDATE proxies
+                         SET is_valid = TRUE, error_count = 0, last_error = NULL,
+                             last_validated = $1, updated_at = $1
+                         WHERE id = $2",
+                        &[&now, id],
+                    )?;
+                } else {
+                    tx.execute(
+                        "UPDATE proxies
+                         SET is_valid = FALSE, error_count = error_count + 1,
+                             last_error = $1, last_validated = $2, updated_at = $2
+                         WHERE id = $3",
+                        &[&err, &now, id],
+                    )?;
+                }
+                if let Some(exit_ip) = exit_ip {
+                    upsert_exit_ip_tx(&mut tx, id, exit_ip, &now)?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+
+    /// Save the exit address observed during validation without erasing richer
+    /// country/risk/capability fields collected by the quality checker.
+    pub fn upsert_proxy_exit_ip(
+        &self,
+        proxy_id: &str,
+        exit_ip: &str,
+    ) -> Result<(), postgres::Error> {
+        let checked_at = chrono::Utc::now().to_rfc3339();
         self.with_conn(|conn| {
             conn.execute(
-                "UPDATE proxies
-                 SET is_valid = FALSE,
-                     error_count = error_count + 1,
-                     last_error = $1,
-                     last_validated = NULL,
-                     local_port = NULL,
-                     updated_at = $2
-                 WHERE id = $3",
-                &[&err, &now, &id],
+                "INSERT INTO proxy_quality (
+                    proxy_id, ip_address, country, ip_type, is_residential,
+                    chatgpt_accessible, google_accessible, risk_score, risk_level,
+                    extra_json, checked_at
+                 ) VALUES ($1, $2, NULL, NULL, FALSE, FALSE, FALSE, 1.0, 'Unknown', NULL, $3)
+                 ON CONFLICT (proxy_id) DO UPDATE SET
+                    ip_address = EXCLUDED.ip_address,
+                    country = CASE
+                        WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                        THEN NULL ELSE proxy_quality.country END,
+                    ip_type = CASE
+                        WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                        THEN NULL ELSE proxy_quality.ip_type END,
+                    is_residential = CASE
+                        WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                        THEN FALSE ELSE proxy_quality.is_residential END,
+                    chatgpt_accessible = CASE
+                        WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                        THEN FALSE ELSE proxy_quality.chatgpt_accessible END,
+                    google_accessible = CASE
+                        WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                        THEN FALSE ELSE proxy_quality.google_accessible END,
+                    risk_score = CASE
+                        WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                        THEN 1.0 ELSE proxy_quality.risk_score END,
+                    risk_level = CASE
+                        WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                        THEN 'Unknown' ELSE proxy_quality.risk_level END,
+                    extra_json = CASE
+                        WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                        THEN NULL ELSE proxy_quality.extra_json END,
+                    checked_at = CASE
+                        WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                        THEN EXCLUDED.checked_at ELSE proxy_quality.checked_at END",
+                &[&proxy_id, &exit_ip, &checked_at],
             )?;
+            Ok(())
+        })
+    }
+
+    pub fn mark_proxy_relay_failed(&self, id: &str, error: &str) -> Result<(), postgres::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let err = error.to_string();
+        let ids = self.get_exact_duplicate_proxy_ids(id)?;
+        self.with_conn(|conn| {
+            for duplicate_id in &ids {
+                conn.execute(
+                    "UPDATE proxies
+                     SET is_valid = FALSE,
+                         error_count = error_count + 1,
+                         last_error = $1,
+                         last_validated = NULL,
+                         local_port = NULL,
+                         updated_at = $2
+                     WHERE id = $3",
+                    &[&err, &now, duplicate_id],
+                )?;
+            }
             Ok(())
         })
     }
@@ -1287,7 +1774,11 @@ impl Database {
         })
     }
 
-    pub fn update_proxy_local_port(&self, id: &str, local_port: i32) -> Result<(), postgres::Error> {
+    pub fn update_proxy_local_port(
+        &self,
+        id: &str,
+        local_port: i32,
+    ) -> Result<(), postgres::Error> {
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE proxies SET local_port = $1 WHERE id = $2",
@@ -1444,7 +1935,8 @@ impl Database {
                  )",
                 &[&threshold],
             )?;
-            let count = conn.execute("DELETE FROM proxies WHERE error_count >= $1", &[&threshold])?;
+            let count =
+                conn.execute("DELETE FROM proxies WHERE error_count >= $1", &[&threshold])?;
             Ok(count as usize)
         })
     }
@@ -1488,6 +1980,23 @@ impl Database {
         })
     }
 
+    /// Save one quality result for every source row that represents the same
+    /// complete proxy definition. This preserves subscription provenance while
+    /// avoiding duplicate capability probes.
+    pub fn upsert_exact_duplicate_quality(
+        &self,
+        source_id: &str,
+        quality: &ProxyQuality,
+    ) -> Result<Vec<String>, postgres::Error> {
+        let ids = self.get_exact_duplicate_proxy_ids(source_id)?;
+        for id in &ids {
+            let mut copy = quality.clone();
+            copy.proxy_id = id.clone();
+            self.upsert_quality(&copy)?;
+        }
+        Ok(ids)
+    }
+
     pub fn get_quality(&self, proxy_id: &str) -> Result<Option<ProxyQuality>, postgres::Error> {
         self.with_conn(|conn| {
             let row = conn.query_opt(
@@ -1521,15 +2030,20 @@ impl Database {
             let proxy_counts = conn.query_one(
                 "SELECT
                     COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE is_valid = TRUE) AS valid,
+                    COUNT(DISTINCT q.ip_address) FILTER (
+                        WHERE p.is_valid = TRUE
+                          AND q.ip_address IS NOT NULL
+                          AND BTRIM(q.ip_address) <> ''
+                    ) AS valid,
                     COUNT(*) FILTER (
-                        WHERE is_valid = FALSE AND last_validated IS NULL
+                        WHERE p.is_valid = FALSE AND p.last_validated IS NULL
                     ) AS untested,
                     COUNT(*) FILTER (
-                        WHERE is_valid = FALSE AND last_validated IS NOT NULL
+                        WHERE p.is_valid = FALSE AND p.last_validated IS NOT NULL
                     ) AS invalid
-                 FROM proxies
-                 WHERE orphaned_at IS NULL",
+                 FROM proxies p
+                 LEFT JOIN proxy_quality q ON q.proxy_id = p.id
+                 WHERE p.orphaned_at IS NULL",
                 &[],
             )?;
             let total: i64 = proxy_counts.get("total");
@@ -1541,13 +2055,22 @@ impl Database {
                 .get(0);
             let quality_counts = conn.query_one(
                 "SELECT
-                    COUNT(*) AS quality_checked,
-                    COUNT(*) FILTER (WHERE q.chatgpt_accessible = TRUE) AS chatgpt_accessible,
-                    COUNT(*) FILTER (WHERE q.google_accessible = TRUE) AS google_accessible,
-                    COUNT(*) FILTER (WHERE q.is_residential = TRUE) AS residential
+                    COUNT(DISTINCT q.ip_address) AS quality_checked,
+                    COUNT(DISTINCT q.ip_address) FILTER (
+                        WHERE q.chatgpt_accessible = TRUE
+                    ) AS chatgpt_accessible,
+                    COUNT(DISTINCT q.ip_address) FILTER (
+                        WHERE q.google_accessible = TRUE
+                    ) AS google_accessible,
+                    COUNT(DISTINCT q.ip_address) FILTER (
+                        WHERE q.is_residential = TRUE
+                    ) AS residential
                  FROM proxy_quality q
                  JOIN proxies p ON p.id = q.proxy_id
-                 WHERE p.is_valid = TRUE AND p.orphaned_at IS NULL",
+                 WHERE p.is_valid = TRUE
+                   AND p.orphaned_at IS NULL
+                   AND q.ip_address IS NOT NULL
+                   AND BTRIM(q.ip_address) <> ''",
                 &[],
             )?;
             let quality_checked: i64 = quality_counts.get("quality_checked");
@@ -1563,14 +2086,14 @@ impl Database {
                 &[],
             )?;
             let by_country_rows = conn.query(
-                "SELECT q.country, COUNT(*)
+                "SELECT q.country, COUNT(DISTINCT q.ip_address)
                  FROM proxy_quality q
                  JOIN proxies p ON p.id = q.proxy_id
                  WHERE p.is_valid = TRUE
                    AND p.orphaned_at IS NULL
                    AND q.country IS NOT NULL
                  GROUP BY q.country
-                 ORDER BY COUNT(*) DESC",
+                 ORDER BY COUNT(DISTINCT q.ip_address) DESC",
                 &[],
             )?;
 
@@ -1770,11 +2293,59 @@ fn subscription_from_row(row: &Row) -> Subscription {
         url: row.get(3),
         content: row.get(4),
         proxy_count: row.get(5),
-        refresh_interval_mins: row.get(6),
-        last_refresh_at: row.get(7),
-        created_at: row.get(8),
-        updated_at: row.get(9),
+        raw_proxy_count: row.get(6),
+        duplicate_proxy_count: row.get(7),
+        refresh_interval_mins: row.get(8),
+        last_refresh_at: row.get(9),
+        created_at: row.get(10),
+        updated_at: row.get(11),
     }
+}
+
+fn upsert_exit_ip_tx(
+    tx: &mut postgres::Transaction<'_>,
+    proxy_id: &str,
+    exit_ip: &str,
+    checked_at: &str,
+) -> Result<(), postgres::Error> {
+    tx.execute(
+        "INSERT INTO proxy_quality (
+            proxy_id, ip_address, country, ip_type, is_residential,
+            chatgpt_accessible, google_accessible, risk_score, risk_level,
+            extra_json, checked_at
+         ) VALUES ($1, $2, NULL, NULL, FALSE, FALSE, FALSE, 1.0, 'Unknown', NULL, $3)
+         ON CONFLICT (proxy_id) DO UPDATE SET
+            ip_address = EXCLUDED.ip_address,
+            country = CASE
+                WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                THEN NULL ELSE proxy_quality.country END,
+            ip_type = CASE
+                WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                THEN NULL ELSE proxy_quality.ip_type END,
+            is_residential = CASE
+                WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                THEN FALSE ELSE proxy_quality.is_residential END,
+            chatgpt_accessible = CASE
+                WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                THEN FALSE ELSE proxy_quality.chatgpt_accessible END,
+            google_accessible = CASE
+                WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                THEN FALSE ELSE proxy_quality.google_accessible END,
+            risk_score = CASE
+                WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                THEN 1.0 ELSE proxy_quality.risk_score END,
+            risk_level = CASE
+                WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                THEN 'Unknown' ELSE proxy_quality.risk_level END,
+            extra_json = CASE
+                WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                THEN NULL ELSE proxy_quality.extra_json END,
+            checked_at = CASE
+                WHEN proxy_quality.ip_address IS DISTINCT FROM EXCLUDED.ip_address
+                THEN EXCLUDED.checked_at ELSE proxy_quality.checked_at END",
+        &[&proxy_id, &exit_ip, &checked_at],
+    )?;
+    Ok(())
 }
 
 fn proxy_from_row(row: &Row) -> ProxyRow {
@@ -1913,7 +2484,54 @@ fn build_proxy_list_where(
     // part of the current subscription and are excluded from export as well.
     let mut conditions = vec!["p.orphaned_at IS NULL".to_string()];
 
-    if let Some(search) = query.search.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if query.unique_exit_ip {
+        conditions.push(
+            "(
+                q.ip_address IS NULL
+                OR BTRIM(q.ip_address) = ''
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM proxy_quality better_q
+                    JOIN proxies better_p ON better_p.id = better_q.proxy_id
+                    WHERE better_p.orphaned_at IS NULL
+                      AND better_q.ip_address = q.ip_address
+                      AND (
+                        (better_p.is_valid = TRUE AND p.is_valid = FALSE)
+                        OR (
+                            better_p.is_valid = p.is_valid
+                            AND better_p.error_count < p.error_count
+                        )
+                        OR (
+                            better_p.is_valid = p.is_valid
+                            AND better_p.error_count = p.error_count
+                            AND COALESCE(better_p.last_validated, '') > COALESCE(p.last_validated, '')
+                        )
+                        OR (
+                            better_p.is_valid = p.is_valid
+                            AND better_p.error_count = p.error_count
+                            AND COALESCE(better_p.last_validated, '') = COALESCE(p.last_validated, '')
+                            AND better_p.updated_at > p.updated_at
+                        )
+                        OR (
+                            better_p.is_valid = p.is_valid
+                            AND better_p.error_count = p.error_count
+                            AND COALESCE(better_p.last_validated, '') = COALESCE(p.last_validated, '')
+                            AND better_p.updated_at = p.updated_at
+                            AND better_p.id < p.id
+                        )
+                      )
+                )
+            )"
+            .to_string(),
+        );
+    }
+
+    if let Some(search) = query
+        .search
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         params.push(Box::new(format!("%{search}%")));
         let idx = params.len();
         conditions.push(format!(
@@ -1924,12 +2542,12 @@ fn build_proxy_list_where(
     if let Some(status) = query.status.as_deref() {
         match status {
             "valid" => conditions.push("p.is_valid = TRUE".to_string()),
-            "invalid" => conditions.push(
-                "p.is_valid = FALSE AND p.last_validated IS NOT NULL".to_string(),
-            ),
-            "untested" => conditions.push(
-                "p.is_valid = FALSE AND p.last_validated IS NULL".to_string(),
-            ),
+            "invalid" => {
+                conditions.push("p.is_valid = FALSE AND p.last_validated IS NOT NULL".to_string())
+            }
+            "untested" => {
+                conditions.push("p.is_valid = FALSE AND p.last_validated IS NULL".to_string())
+            }
             _ => {}
         }
     }
@@ -1971,6 +2589,11 @@ fn build_fetch_proxy_where(
 
     if only_valid {
         conditions.push("p.is_valid = TRUE".to_string());
+        conditions.push("p.orphaned_at IS NULL".to_string());
+        // Public selection must have a measured exit IP so DISTINCT ON can
+        // guarantee that one response never contains the same exit twice.
+        conditions.push("q.ip_address IS NOT NULL".to_string());
+        conditions.push("BTRIM(q.ip_address) <> ''".to_string());
     }
 
     if let Some(proxy_type) = filter
@@ -2110,7 +2733,9 @@ fn build_proxy_cursor_clause(
     params.push(Box::new(cursor.id.clone()));
     let id_idx = params.len();
     let value_op = if (dir == "ASC") ^ backwards { ">" } else { "<" };
-    let id_op = if backwards { "<" } else { ">" };
+    // Tie-breaker direction follows the effective page traversal direction,
+    // including when the primary sort itself is DESC.
+    let id_op = if (dir == "ASC") ^ backwards { ">" } else { "<" };
     format!(
         "AND (({sort_expr}) {value_op} ${value_idx} OR (({sort_expr}) = ${value_idx} AND p.id {id_op} ${id_idx}))"
     )
@@ -2143,7 +2768,10 @@ mod tests {
 
         let clause = build_fetch_proxy_where(&filter, &mut params, true);
 
-        assert_eq!(clause, "WHERE p.is_valid = TRUE");
+        assert_eq!(
+            clause,
+            "WHERE p.is_valid = TRUE AND p.orphaned_at IS NULL AND q.ip_address IS NOT NULL AND BTRIM(q.ip_address) <> ''"
+        );
         assert!(params.is_empty());
     }
 
@@ -2179,13 +2807,31 @@ mod tests {
     }
 
     #[test]
+    fn descending_cursor_uses_descending_id_tiebreaker() {
+        let cursor = ProxyListCursor {
+            sort: "name".to_string(),
+            dir: "DESC".to_string(),
+            value: "same-name".to_string(),
+            id: "proxy-2".to_string(),
+        };
+        let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
+
+        let next =
+            super::build_proxy_cursor_clause(&cursor, "p.name", "name", "DESC", false, &mut params);
+        assert!(next.contains("p.id < $2"));
+
+        let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
+        let previous =
+            super::build_proxy_cursor_clause(&cursor, "p.name", "name", "DESC", true, &mut params);
+        assert!(previous.contains("p.id > $2"));
+    }
+
+    #[test]
     fn build_random_valid_proxy_order_by_deprioritizes_recent_failures_without_dropping_them() {
         let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
 
-        let clause = build_random_valid_proxy_order_by(
-            &mut params,
-            Some("2026-03-26T00:00:00+00:00"),
-        );
+        let clause =
+            build_random_valid_proxy_order_by(&mut params, Some("2026-03-26T00:00:00+00:00"));
 
         assert!(clause.contains("WHEN p.error_count = 0 THEN 0"));
         assert!(clause.contains("WHEN p.updated_at <= $1 THEN 1"));
